@@ -55,10 +55,6 @@ A feature-rich terminal-based chess game with online multiplayer, AI opponent, a
    cd terminalchess
    ```
 
-2. **(Optional) Reset the database:**
-   ```bash
-   cp database_empty.json database.json
-   ```
 
 ## Usage
 
