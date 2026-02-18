@@ -34,6 +34,223 @@ import json
 import re
 import math
 import random
+import secrets
+import base64
+from hmac import compare_digest
+
+# ════════════════════════════════════════════════════════════════════════
+#  E2E ENCRYPTION UTILITIES (Pure Python stdlib - AES-GCM + ECDH-like)
+# ════════════════════════════════════════════════════════════════════════
+
+def _xor_bytes(a: bytes, b: bytes) -> bytes:
+    """XOR two byte strings."""
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def _bytes_to_int(b: bytes) -> int:
+    """Convert bytes to integer (big-endian)."""
+    return int.from_bytes(b, 'big')
+
+def _int_to_bytes(n: int, length: int = 256) -> bytes:
+    """Convert integer to bytes (big-endian). Default 256 bytes for 2048-bit DH."""
+    return n.to_bytes(length, 'big')
+
+def _mod_pow(base: int, exp: int, mod: int) -> int:
+    """Modular exponentiation."""
+    result = 1
+    base = base % mod
+    while exp > 0:
+        if exp & 1:
+            result = (result * base) % mod
+        exp >>= 1
+        base = (base * base) % mod
+    return result
+
+# 2048-bit MODP Group (RFC 3526) - same as server
+_DH_P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16
+)
+_DH_G = 2
+_DH_PRIVATE_BITS = 256
+
+def _dh_generate_keypair():
+    """Generate Diffie-Hellman key pair."""
+    private_key = secrets.randbits(_DH_PRIVATE_BITS)
+    public_key = _mod_pow(_DH_G, private_key, _DH_P)
+    return private_key, public_key
+
+def _dh_compute_shared_secret(private_key: int, other_public: int) -> bytes:
+    """Compute DH shared secret and derive AES key."""
+    shared = _mod_pow(other_public, private_key, _DH_P)
+    return hashlib.sha256(_int_to_bytes(shared)).digest()
+
+def _aes_encrypt_block(block: bytes, key: bytes) -> bytes:
+    """AES-256 encryption (pure Python implementation)."""
+    SBOX = bytes([
+        0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+        0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+        0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+        0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+        0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+        0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+        0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+        0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+        0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+        0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+        0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+        0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+        0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+        0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+        0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+        0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+    ])
+    RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36, 0x6c, 0xd8, 0xab, 0x4d, 0x9a]
+    
+    def sub_bytes(state):
+        return [SBOX[b] for b in state]
+    
+    def shift_rows(state):
+        s = state[:]
+        s[1], s[5], s[9], s[13] = state[5], state[9], state[13], state[1]
+        s[2], s[6], s[10], s[14] = state[10], state[14], state[2], state[6]
+        s[3], s[7], s[11], s[15] = state[15], state[3], state[7], state[11]
+        return s
+    
+    def xtime(a):
+        return ((a << 1) ^ 0x1b) & 0xff if a & 0x80 else (a << 1) & 0xff
+    
+    def mix_single_column(col):
+        t = col[0] ^ col[1] ^ col[2] ^ col[3]
+        u = col[0]
+        col[0] ^= t ^ xtime(col[0] ^ col[1])
+        col[1] ^= t ^ xtime(col[1] ^ col[2])
+        col[2] ^= t ^ xtime(col[2] ^ col[3])
+        col[3] ^= t ^ xtime(col[3] ^ u)
+        return col
+    
+    def mix_columns(state):
+        s = state[:]
+        for i in range(4):
+            col = mix_single_column(s[i*4:(i+1)*4])
+            s[i*4:(i+1)*4] = col
+        return s
+    
+    def add_round_key(state, round_key):
+        return [s ^ k for s, k in zip(state, round_key)]
+    
+    def key_expansion(key):
+        key_schedule = list(key)
+        for i in range(4, 60):
+            temp = key_schedule[(i-1)*4:(i)*4]
+            if i % 4 == 0:
+                temp = [SBOX[temp[1]], SBOX[temp[2]], SBOX[temp[3]], SBOX[temp[0]]]
+                temp[0] ^= RCON[i//4 - 1]
+            for j in range(4):
+                key_schedule.append(key_schedule[(i-4)*4 + j] ^ temp[j])
+        return key_schedule
+    
+    key_schedule = key_expansion(key)
+    state = list(block)
+    state = add_round_key(state, key_schedule[:16])
+    for round_num in range(1, 14):
+        state = sub_bytes(state)
+        state = shift_rows(state)
+        state = mix_columns(state)
+        state = add_round_key(state, key_schedule[round_num*16:(round_num+1)*16])
+    state = sub_bytes(state)
+    state = shift_rows(state)
+    state = add_round_key(state, key_schedule[14*16:15*16])
+    return bytes(state)
+
+def _aes_ctr_encrypt(plaintext: bytes, key: bytes, nonce: bytes) -> bytes:
+    """AES-256 CTR mode encryption."""
+    result = bytearray()
+    counter = 0
+    for i in range(0, len(plaintext), 16):
+        counter_block = nonce + _int_to_bytes(counter, 4)[:4]
+        keystream = _aes_encrypt_block(counter_block, key)
+        block = plaintext[i:i+16]
+        encrypted = _xor_bytes(block, keystream[:len(block)])
+        result.extend(encrypted)
+        counter += 1
+    return bytes(result)
+
+def _aes_ctr_decrypt(ciphertext: bytes, key: bytes, nonce: bytes) -> bytes:
+    """AES-256 CTR mode decryption."""
+    return _aes_ctr_encrypt(ciphertext, key, nonce)
+
+def _ghash(h: bytes, data: bytes) -> bytes:
+    """GHASH for GCM mode."""
+    def gf_mult(x: int, y: int) -> int:
+        z = 0
+        for i in range(128):
+            if (x >> (127 - i)) & 1:
+                z ^= y
+            if y & 1:
+                y = (y >> 1) ^ 0xe1000000000000000000000000000000
+            else:
+                y >>= 1
+        return z
+    
+    h_int = _bytes_to_int(h)
+    result = 0
+    for i in range(0, len(data), 16):
+        block = data[i:i+16]
+        if len(block) < 16:
+            block = block + b'\x00' * (16 - len(block))
+        result = gf_mult(result ^ _bytes_to_int(block), h_int)
+    return _int_to_bytes(result, 16)
+
+def _gcm_encrypt(plaintext: bytes, key: bytes, nonce: bytes, aad: bytes = b'') -> tuple:
+    """AES-GCM encryption."""
+    h = _aes_encrypt_block(b'\x00' * 16, key)
+    j0 = nonce + b'\x00\x00\x00\x01' if len(nonce) == 12 else nonce + b'\x00' * (16 - len(nonce) % 16) + b'\x00\x00\x00\x01'
+    ciphertext = _aes_ctr_encrypt(plaintext, key, j0[:12])
+    ghash_input = aad + b'\x00' * ((16 - len(aad) % 16) % 16) if aad else b''
+    ghash_input += ciphertext + b'\x00' * ((16 - len(ciphertext) % 16) % 16)
+    ghash_input += _int_to_bytes(len(aad) * 8, 8) + _int_to_bytes(len(ciphertext) * 8, 8)
+    s = _ghash(h, ghash_input)
+    tag_input = _aes_encrypt_block(j0, key)
+    tag = _xor_bytes(s, tag_input)
+    return ciphertext, tag
+
+def _gcm_decrypt(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes, aad: bytes = b'') -> bytes:
+    """AES-GCM decryption."""
+    h = _aes_encrypt_block(b'\x00' * 16, key)
+    j0 = nonce + b'\x00\x00\x00\x01' if len(nonce) == 12 else nonce + b'\x00' * (16 - len(nonce) % 16) + b'\x00\x00\x00\x01'
+    ghash_input = aad + b'\x00' * ((16 - len(aad) % 16) % 16) if aad else b''
+    ghash_input += ciphertext + b'\x00' * ((16 - len(ciphertext) % 16) % 16)
+    ghash_input += _int_to_bytes(len(aad) * 8, 8) + _int_to_bytes(len(ciphertext) * 8, 8)
+    s = _ghash(h, ghash_input)
+    tag_input = _aes_encrypt_block(j0, key)
+    computed_tag = _xor_bytes(s, tag_input)
+    if not compare_digest(computed_tag, tag):
+        raise ValueError("Authentication tag verification failed")
+    plaintext = _aes_ctr_decrypt(ciphertext, key, j0[:12])
+    return plaintext
+
+def encrypt_credentials(credentials: dict, server_public: int) -> dict:
+    """Encrypt credentials using ECDH + AES-GCM."""
+    client_private, client_public = _dh_generate_keypair()
+    shared_secret = _dh_compute_shared_secret(client_private, server_public)
+    credentials_json = json.dumps(credentials).encode('utf-8')
+    nonce = secrets.token_bytes(12)
+    ciphertext, tag = _gcm_encrypt(credentials_json, shared_secret, nonce)
+    return {
+        'client_public': client_public,
+        'nonce': base64.b64encode(nonce).decode(),
+        'ciphertext': base64.b64encode(ciphertext).decode(),
+        'tag': base64.b64encode(tag).decode()
+    }
 
 # ════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -42,7 +259,9 @@ import random
 # ════════════════════════════════════════════════════════════════════════
 def clear_screen():
     """Clear the terminal screen."""
-    os.system('clear' if os.name != 'nt' else 'cls')
+    # Use ANSI escape codes for reliable clearing across platforms
+    # \033[2J clears the entire screen, \033[H moves cursor to home position
+    print('\033[2J\033[H', end='', flush=True)
 
 # ════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -562,6 +781,7 @@ class OpeningBook:
             "e4 g6 d4 Bg7 Nc3 d6 Be3 Nf6 Qd2 O-O",
             "e4 Nf6",                  # Alekhine
             "e4 Nf6 e5 Nd5 d4 d6 Nf3 Bg4 Be2 e6 O-O Be7",
+            "e4 e5 Nf3 Nc6 c3 d5", #ponziani
             # d4 openings
             "d4 d5 c4",                # QGD
             "d4 d5 c4 e6 Nc3 Nf6 Bg5 Be7 e3 O-O Nf3 h6 Bh4 b6",
@@ -1654,8 +1874,14 @@ def show_online_leaderboard(n=10):
             return
     
     response = _server_client.get_leaderboard(n)
-    if response is None or not response.get('success'):
-        print("  Cannot retrieve leaderboard from server.")
+    if response is None:
+        print("  Cannot retrieve leaderboard from server (no response).")
+        print("  Showing local leaderboard instead...")
+        elo_sys = EloSystem()
+        elo_sys.leaderboard(n)
+        return
+    if not response.get('success'):
+        print(f"  Cannot retrieve leaderboard from server: {response.get('data', 'Unknown error')}")
         print("  Showing local leaderboard instead...")
         elo_sys = EloSystem()
         elo_sys.leaderboard(n)
@@ -1824,6 +2050,10 @@ MSG_FRIEND_LIST = 'FRIEND_LIST'
 MSG_FRIEND_REMOVE = 'FRIEND_REMOVE'
 MSG_FRIEND_STATUS = 'FRIEND_STATUS'
 
+# E2E Encryption message types
+MSG_GET_SERVER_PUBLIC_KEY = 'GET_SERVER_PUBLIC_KEY'
+MSG_SESSION_KEY_EXCHANGE = 'SESSION_KEY_EXCHANGE'
+
 # Messaging system message types
 MSG_SEND_MESSAGE = 'SEND_MESSAGE'
 MSG_GET_MESSAGES = 'GET_MESSAGES'
@@ -1856,6 +2086,39 @@ class ChessClient:
         self.sock = None
         self.logged_in_user = None
         self.pending = b''
+        # E2E encryption session
+        self.session_key = None
+        self.client_private = None
+        self.client_public = None
+        self.encryption_enabled = False
+        self._nonce_counter = 0
+
+    def _derive_nonce(self):
+        """Derive a unique nonce for each message (12 bytes for GCM)."""
+        self._nonce_counter += 1
+        # Pack counter as 8-byte big-endian, then pad to 12 bytes
+        return b'\x00\x00\x00\x00' + struct.pack('>Q', self._nonce_counter)
+
+    def _encrypt_message(self, plaintext: bytes) -> bytes:
+        """Encrypt a message using session key."""
+        if not self.encryption_enabled or self.session_key is None:
+            return plaintext
+        nonce = self._derive_nonce()
+        ciphertext, tag = _gcm_encrypt(plaintext, self.session_key, nonce)
+        return b'E' + nonce + ciphertext + tag
+
+    def _decrypt_message(self, ciphertext: bytes) -> bytes:
+        """Decrypt a message using session key."""
+        if not self.encryption_enabled or self.session_key is None:
+            return ciphertext
+        if len(ciphertext) < 29:
+            raise ValueError("Invalid encrypted message")
+        if ciphertext[0:1] != b'E':
+            raise ValueError("Invalid encryption flag")
+        nonce = ciphertext[1:13]
+        encrypted_data = ciphertext[13:-16]
+        tag = ciphertext[-16:]
+        return _gcm_decrypt(encrypted_data, self.session_key, nonce, tag)
 
     def connect(self):
         """Connect to the server."""
@@ -1880,13 +2143,17 @@ class ChessClient:
         self.logged_in_user = None
         if self.sock:
             try:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
                 self.sock.close()
             except:
                 pass
             self.sock = None
 
     def send(self, msg_type, data=None):
-        """Send a message to the server."""
+        """Send a message to the server (encrypted if session established)."""
         if not self.sock:
             return False
 
@@ -1894,6 +2161,10 @@ class ChessClient:
             'type': msg_type,
             'data': data or {}
         }).encode()
+
+        # Encrypt if session is established (but not for key exchange messages)
+        if self.encryption_enabled and self.session_key and msg_type not in [MSG_GET_SERVER_PUBLIC_KEY, MSG_SESSION_KEY_EXCHANGE]:
+            payload = self._encrypt_message(payload)
 
         header = struct.pack('>I', len(payload))
 
@@ -1904,7 +2175,7 @@ class ChessClient:
             return False
 
     def recv(self, timeout=5.0):
-        """Receive a response from the server."""
+        """Receive a response from the server (decrypt if session established)."""
         if not self.sock:
             return None
 
@@ -1916,6 +2187,9 @@ class ChessClient:
                     if len(self.pending) >= 4 + length:
                         payload = self.pending[4:4 + length]
                         self.pending = self.pending[4 + length:]
+                        # Try to decrypt if encryption is enabled
+                        if self.encryption_enabled and self.session_key and payload[0:1] == b'E':
+                            payload = self._decrypt_message(payload)
                         return json.loads(payload.decode())
 
                 chunk = self.sock.recv(4096)
@@ -1927,24 +2201,102 @@ class ChessClient:
         except Exception as e:
             return None
 
-    def register(self, username, password, email):
-        """Register a new account."""
-        self.send(MSG_REGISTER, {
-            'username': username,
-            'password': password,
-            'email': email
+    def get_server_public_key(self):
+        """Get server's public key for E2E encryption."""
+        if not self.sock:
+            print("  [ERROR] get_server_public_key: not connected", flush=True)
+            return None
+        self.send(MSG_GET_SERVER_PUBLIC_KEY)
+        response = self.recv(timeout=10.0)  # Increase timeout
+        if response and response.get('success'):
+            return response.get('data', {}).get('server_public')
+        print(f"  [WARN] get_server_public_key: got response={response}", flush=True)
+        return None
+
+    def session_key_exchange(self):
+        """Establish E2E encryption session with the server."""
+        # Generate client DH key pair
+        self.client_private, self.client_public = _dh_generate_keypair()
+
+        # Send client's public key to server
+        self.send(MSG_SESSION_KEY_EXCHANGE, {
+            'client_public': self.client_public
         })
-        return self.recv()
-    
-    def login(self, username, password):
-        """Login to an account."""
-        self.send(MSG_LOGIN, {
-            'username': username,
-            'password': password
-        })
-        response = self.recv()
+
+        response = self.recv(timeout=10.0)
+        if response and response.get('success'):
+            # Get server's public key from response
+            server_public = response.get('data', {}).get('server_public')
+            if not server_public:
+                # Fallback: try to get it separately
+                server_public = self.get_server_public_key()
+
+            if server_public:
+                # Compute shared secret using client private key and server public key
+                shared_secret = _dh_compute_shared_secret(self.client_private, server_public)
+                self.session_key = shared_secret
+                self.encryption_enabled = True
+                self._nonce_counter = 0
+                return True
+        return False
+
+    def register(self, username, password, email, use_encryption=True):
+        """Register a new account with optional E2E encryption."""
+        if use_encryption:
+            # Get server's public key
+            server_public = self.get_server_public_key()
+            if server_public is None:
+                print("  [WARN] Failed to get server public key, falling back to plaintext")
+                use_encryption = False
+
+        if use_encryption and server_public is not None:
+            # Encrypt credentials
+            credentials = {
+                'username': username,
+                'password': password,
+                'email': email
+            }
+            encrypted_data = encrypt_credentials(credentials, server_public)
+            encrypted_data['encrypted'] = True
+            self.send(MSG_REGISTER, encrypted_data)
+        else:
+            self.send(MSG_REGISTER, {
+                'username': username,
+                'password': password,
+                'email': email
+            })
+        response = self.recv(timeout=10.0)
+        return response
+
+    def login(self, username, password, use_encryption=True):
+        """Login to an account with optional E2E encryption."""
+        if use_encryption:
+            # Get server's public key
+            server_public = self.get_server_public_key()
+            if server_public is None:
+                print("  [WARN] Failed to get server public key, falling back to plaintext")
+                use_encryption = False
+
+        if use_encryption and server_public is not None:
+            # Encrypt credentials
+            credentials = {
+                'username': username,
+                'password': password
+            }
+            encrypted_data = encrypt_credentials(credentials, server_public)
+            encrypted_data['encrypted'] = True
+            self.send(MSG_LOGIN, encrypted_data)
+        else:
+            self.send(MSG_LOGIN, {
+                'username': username,
+                'password': password
+            })
+        response = self.recv(timeout=10.0)  # Increase timeout
         if response and response.get('success'):
             self.logged_in_user = username
+            # Establish E2E encryption session after successful login
+            if use_encryption and server_public is not None:
+                self.session_key_exchange()
         return response
 
     def auto_login(self, username, password_hash):
@@ -1953,15 +2305,17 @@ class ChessClient:
             'username': username,
             'password_hash': password_hash
         })
-        response = self.recv()
+        response = self.recv(timeout=10.0)  # Increase timeout
         if response and response.get('success'):
             self.logged_in_user = username
+            # Establish E2E encryption session after successful auto-login
+            self.session_key_exchange()
         return response
 
     def logout(self):
         """Logout from the account."""
         self.send(MSG_LOGOUT)
-        response = self.recv()
+        response = self.recv(timeout=10.0)
         if response and response.get('success'):
             self.logged_in_user = None
         return response
@@ -1970,8 +2324,8 @@ class ChessClient:
         """Get a user's profile."""
         data = {'username': username} if username else {}
         self.send(MSG_GET_PROFILE, data)
-        return self.recv()
-    
+        return self.recv(timeout=10.0)
+
     def save_game(self, white, black, result, moves, duration=0, rated=True):
         """Save a game to history."""
         self.send(MSG_SAVE_GAME, {
@@ -1982,33 +2336,33 @@ class ChessClient:
             'duration': duration,
             'rated': rated
         })
-        return self.recv()
+        return self.recv(timeout=10.0)
     
     def list_users(self):
         """Get list of all users."""
         self.send(MSG_LIST_USERS)
-        return self.recv()
+        return self.recv(timeout=10.0)
     
     # Matchmaking methods
     def join_queue(self):
         """Join the matchmaking queue."""
         self.send(MSG_QUEUE_JOIN, {'username': self.logged_in_user or _current_user})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def leave_queue(self):
         """Leave the matchmaking queue."""
         self.send(MSG_QUEUE_LEAVE, {'username': self.logged_in_user or _current_user})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def get_queue_status(self):
         """Get queue status."""
         self.send(MSG_QUEUE_STATUS, {'username': self.logged_in_user or _current_user})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def trigger_matchmaking(self):
         """Trigger immediate matchmaking check."""
         self.send(MSG_QUEUE_STATUS, {'trigger': True, 'username': self.logged_in_user or _current_user})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def send_move(self, game_id, move):
         """Send a move in an active game."""
@@ -2016,20 +2370,20 @@ class ChessClient:
             'game_id': game_id,
             'move': move
         })
-        return self.recv()
-    
+        return self.recv(timeout=10.0)
+
     def resign_game(self, game_id):
         """Resign from a game."""
         self.send(MSG_GAME_RESIGN, {
             'game_id': game_id
         })
-    
+
     def offer_draw(self, game_id):
         """Offer a draw to opponent."""
         self.send(MSG_GAME_DRAW_OFFER, {
             'game_id': game_id
         })
-    
+
     def accept_draw(self, game_id):
         """Accept a draw offer."""
         self.send(MSG_GAME_DRAW_ACCEPT, {
@@ -2046,7 +2400,7 @@ class ChessClient:
     def get_leaderboard(self, limit=10):
         """Get ELO leaderboard."""
         self.send(MSG_LEADERBOARD, {'limit': limit})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     # ════════════════════════════════════════════════════════════════════
     #  FRIEND SYSTEM METHODS
@@ -2054,27 +2408,27 @@ class ChessClient:
     def send_friend_request(self, recipient):
         """Send a friend request."""
         self.send(MSG_FRIEND_REQUEST, {'recipient': recipient})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def respond_to_friend_request(self, sender, accept):
         """Respond to a friend request."""
         self.send(MSG_FRIEND_RESPONSE, {'sender': sender, 'accept': accept})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def get_friend_list(self):
         """Get list of friends."""
         self.send(MSG_FRIEND_LIST)
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def remove_friend(self, friend):
         """Remove a friend."""
         self.send(MSG_FRIEND_REMOVE, {'friend': friend})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def get_friend_requests(self):
         """Get pending friend requests."""
         self.send(MSG_FRIEND_STATUS)
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     # ════════════════════════════════════════════════════════════════════
     #  MESSAGING SYSTEM METHODS
@@ -2082,7 +2436,7 @@ class ChessClient:
     def key_exchange(self, public_key, key_type='dh'):
         """Perform key exchange for E2E encryption."""
         self.send(MSG_KEY_EXCHANGE, {'public_key': public_key, 'key_type': key_type})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def send_message(self, recipient, encrypted_content, iv, tag):
         """Send an encrypted message."""
@@ -2092,12 +2446,12 @@ class ChessClient:
             'iv': iv,
             'tag': tag
         })
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def get_messages(self, friend, since_id=0):
         """Get messages with a friend."""
         self.send(MSG_GET_MESSAGES, {'friend': friend, 'since_id': since_id})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     # ════════════════════════════════════════════════════════════════════
     #  CHALLENGE SYSTEM METHODS
@@ -2109,22 +2463,22 @@ class ChessClient:
             'color_choice': color_choice,
             'rated': rated
         })
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def respond_to_challenge(self, challenger, accept):
         """Respond to a challenge."""
         self.send(MSG_CHALLENGE_RESPONSE, {'challenger': challenger, 'accept': accept})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def get_challenges(self):
         """Get pending challenges."""
         self.send(MSG_CHALLENGE_LIST)
-        return self.recv()
+        return self.recv(timeout=10.0)
 
     def cancel_challenge(self, challenged):
         """Cancel a pending challenge."""
         self.send(MSG_CHALLENGE_CANCEL, {'challenged': challenged})
-        return self.recv()
+        return self.recv(timeout=10.0)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2371,7 +2725,9 @@ def register_user():
         break
     
     # Register with server
+    print(f"  [DEBUG] register_user: calling _server_client.register()", flush=True)
     response = _server_client.register(username, password, email)
+    print(f"  [DEBUG] register_user: response={response}", flush=True)
     if response and response.get('success'):
         print(f"\n  ✓ {response.get('data', 'Registration successful')}")
         set_current_user(username)
@@ -2417,23 +2773,23 @@ def login_user():
     if response and response.get('success'):
         print(f"\n  ✓ Welcome back, {username}!")
         set_current_user(username)
-        
+
         # Offer to save credentials for auto-login
         try:
             save = input("\n  Save credentials for auto-login? [Y/n]: ").strip().lower()
         except EOFError:
             save = 'n'
-        
+
         if save in ('y', 'yes', ''):
             if _save_credentials(username, password):
                 print("  ✓ Credentials saved. You will be auto-logged in next time.")
             else:
                 print("  ✗ Failed to save credentials.")
-        
+
         return username
     else:
-        error_msg = response.get('data', 'Login failed') if response else 'Login failed'
-        print(f"\n  ✗ {error_msg}")
+        error_msg = response.get('data', 'Login failed') if response else 'No response from server'
+        print(f"\n  ✗ Login failed: {error_msg}")
         return None
 
 def logout_user():
@@ -2781,7 +3137,15 @@ def view_friends_list():
     print("\n  ╔══════════════════════════════════════════════════════════╗")
     print("  ║              YOUR FRIENDS                                ║")
     print("  ╚══════════════════════════════════════════════════════════╝")
-    
+
+    # Check if client is connected
+    if not _server_client or not _server_client.sock:
+        print("  Not connected to server. Please connect first.")
+        success, msg = connect_to_server()
+        if not success:
+            print(f"  {msg}")
+            return
+
     response = _server_client.get_friend_list()
     if not response or not response.get('success'):
         print(f"  Error: {response.get('data', 'Unknown error') if response else 'No response'}")
@@ -2833,11 +3197,20 @@ def add_friend():
     print("\n  ╔══════════════════════════════════════════════════════════╗")
     print("  ║              ADD FRIEND                                  ║")
     print("  ╚══════════════════════════════════════════════════════════╝")
-    
+
     # First show list of users
+    # Check if client is connected
+    if not _server_client or not _server_client.sock:
+        print("  Not connected to server. Please connect first.")
+        success, msg = connect_to_server()
+        if not success:
+            print(f"  {msg}")
+            return
+    
     response = _server_client.list_users()
     if not response or not response.get('success'):
         print("  Could not fetch user list.")
+        print(f"  Debug: response={response}")
         return
     
     users = response.get('data', [])
@@ -2864,7 +3237,15 @@ def friend_requests_menu():
     print("\n  ╔══════════════════════════════════════════════════════════╗")
     print("  ║           FRIEND REQUESTS                                ║")
     print("  ╚══════════════════════════════════════════════════════════╝")
-    
+
+    # Check if client is connected
+    if not _server_client or not _server_client.sock:
+        print("  Not connected to server. Please connect first.")
+        success, msg = connect_to_server()
+        if not success:
+            print(f"  {msg}")
+            return
+
     response = _server_client.get_friend_requests()
     if not response or not response.get('success'):
         print(f"  Error: {response.get('data', 'Unknown error') if response else 'No response'}")
