@@ -1817,6 +1817,24 @@ MSG_GAME_DRAW_OFFER = 'GAME_DRAW_OFFER'
 MSG_GAME_DRAW_ACCEPT = 'GAME_DRAW_ACCEPT'
 MSG_GAME_CHAT = 'GAME_CHAT'
 
+# Friend system message types
+MSG_FRIEND_REQUEST = 'FRIEND_REQUEST'
+MSG_FRIEND_RESPONSE = 'FRIEND_RESPONSE'
+MSG_FRIEND_LIST = 'FRIEND_LIST'
+MSG_FRIEND_REMOVE = 'FRIEND_REMOVE'
+MSG_FRIEND_STATUS = 'FRIEND_STATUS'
+
+# Messaging system message types
+MSG_SEND_MESSAGE = 'SEND_MESSAGE'
+MSG_GET_MESSAGES = 'GET_MESSAGES'
+MSG_NEW_MESSAGE_NOTIFY = 'NEW_MESSAGE_NOTIFY'
+
+# Challenge system message types
+MSG_CHALLENGE_SEND = 'CHALLENGE_SEND'
+MSG_CHALLENGE_RESPONSE = 'CHALLENGE_RESPONSE'
+MSG_CHALLENGE_LIST = 'CHALLENGE_LIST'
+MSG_CHALLENGE_CANCEL = 'CHALLENGE_CANCEL'
+
 # Response types
 RESP_SUCCESS = 'SUCCESS'
 RESP_ERROR = 'ERROR'
@@ -2028,6 +2046,84 @@ class ChessClient:
     def get_leaderboard(self, limit=10):
         """Get ELO leaderboard."""
         self.send(MSG_LEADERBOARD, {'limit': limit})
+        return self.recv()
+
+    # ════════════════════════════════════════════════════════════════════
+    #  FRIEND SYSTEM METHODS
+    # ════════════════════════════════════════════════════════════════════
+    def send_friend_request(self, recipient):
+        """Send a friend request."""
+        self.send(MSG_FRIEND_REQUEST, {'recipient': recipient})
+        return self.recv()
+
+    def respond_to_friend_request(self, sender, accept):
+        """Respond to a friend request."""
+        self.send(MSG_FRIEND_RESPONSE, {'sender': sender, 'accept': accept})
+        return self.recv()
+
+    def get_friend_list(self):
+        """Get list of friends."""
+        self.send(MSG_FRIEND_LIST)
+        return self.recv()
+
+    def remove_friend(self, friend):
+        """Remove a friend."""
+        self.send(MSG_FRIEND_REMOVE, {'friend': friend})
+        return self.recv()
+
+    def get_friend_requests(self):
+        """Get pending friend requests."""
+        self.send(MSG_FRIEND_STATUS)
+        return self.recv()
+
+    # ════════════════════════════════════════════════════════════════════
+    #  MESSAGING SYSTEM METHODS
+    # ════════════════════════════════════════════════════════════════════
+    def key_exchange(self, public_key, key_type='dh'):
+        """Perform key exchange for E2E encryption."""
+        self.send(MSG_KEY_EXCHANGE, {'public_key': public_key, 'key_type': key_type})
+        return self.recv()
+
+    def send_message(self, recipient, encrypted_content, iv, tag):
+        """Send an encrypted message."""
+        self.send(MSG_SEND_MESSAGE, {
+            'recipient': recipient,
+            'encrypted_content': encrypted_content,
+            'iv': iv,
+            'tag': tag
+        })
+        return self.recv()
+
+    def get_messages(self, friend, since_id=0):
+        """Get messages with a friend."""
+        self.send(MSG_GET_MESSAGES, {'friend': friend, 'since_id': since_id})
+        return self.recv()
+
+    # ════════════════════════════════════════════════════════════════════
+    #  CHALLENGE SYSTEM METHODS
+    # ════════════════════════════════════════════════════════════════════
+    def send_challenge(self, challenged, color_choice='random', rated=True):
+        """Send a game challenge."""
+        self.send(MSG_CHALLENGE_SEND, {
+            'challenged': challenged,
+            'color_choice': color_choice,
+            'rated': rated
+        })
+        return self.recv()
+
+    def respond_to_challenge(self, challenger, accept):
+        """Respond to a challenge."""
+        self.send(MSG_CHALLENGE_RESPONSE, {'challenger': challenger, 'accept': accept})
+        return self.recv()
+
+    def get_challenges(self):
+        """Get pending challenges."""
+        self.send(MSG_CHALLENGE_LIST)
+        return self.recv()
+
+    def cancel_challenge(self, challenged):
+        """Cancel a pending challenge."""
+        self.send(MSG_CHALLENGE_CANCEL, {'challenged': challenged})
         return self.recv()
 
 
@@ -2576,6 +2672,462 @@ def list_all_users():
             current_marker = " (you)" if user == _current_user else ""
             print(f"    • {user}{current_marker}")
     print()
+
+# ════════════════════════════════════════════════════════════════════════
+#  FRIENDS & MESSAGING SYSTEM
+# ════════════════════════════════════════════════════════════════════════
+
+# In-memory storage for E2E encryption keys
+_user_private_keys = {}
+_user_public_keys = {}
+
+def _generate_keypair():
+    """Generate a simple keypair for E2E encryption (simplified for demonstration)."""
+    # In a real implementation, use proper cryptographic libraries
+    # This is a simplified version for demonstration
+    import hashlib
+    import secrets
+    
+    # Generate a random private key
+    private_key = secrets.token_hex(32)
+    # Generate a public key (simplified - in reality would use DH or RSA)
+    public_key = hashlib.sha256(private_key.encode()).hexdigest()
+    
+    return private_key, public_key
+
+def _encrypt_message(message, recipient_public_key):
+    """Encrypt a message for a recipient (simplified)."""
+    # In a real implementation, use proper AES-GCM encryption
+    # This is a simplified version for demonstration
+    import base64
+    import hashlib
+    import os
+    
+    # Generate a random IV and key
+    iv = os.urandom(12)
+    key = hashlib.sha256(recipient_public_key.encode()).digest()
+    
+    # Simple XOR encryption (NOT secure - for demonstration only)
+    # In production, use cryptography library with AES-GCM
+    message_bytes = message.encode()
+    encrypted = bytes(a ^ b for a, b in zip(message_bytes, (key * ((len(message_bytes) // 32) + 1))[:len(message_bytes)]))
+    
+    return base64.b64encode(encrypted).decode(), base64.b64encode(iv).decode(), "demo_tag"
+
+def _decrypt_message(encrypted_content, iv, tag, sender_public_key):
+    """Decrypt a message from a sender (simplified)."""
+    import base64
+    import hashlib
+    
+    key = hashlib.sha256(sender_public_key.encode()).digest()
+    encrypted_bytes = base64.b64decode(encrypted_content)
+    
+    # Simple XOR decryption (NOT secure - for demonstration only)
+    decrypted = bytes(a ^ b for a, b in zip(encrypted_bytes, (key * ((len(encrypted_bytes) // 32) + 1))[:len(encrypted_bytes)]))
+    
+    return decrypted.decode()
+
+def friends_messaging_menu():
+    """Main menu for friends and messaging."""
+    global _current_user, _server_client
+    
+    if not _current_user:
+        print("\n  ╔══════════════════════════════════════════════════════════╗")
+        print("  ║           PLEASE LOG IN FIRST                            ║")
+        print("  ╚══════════════════════════════════════════════════════════╝")
+        return
+    
+    # Perform key exchange on entering the menu
+    private_key, public_key = _generate_keypair()
+    _user_private_keys[_current_user] = private_key
+    _user_public_keys[_current_user] = public_key
+    
+    _server_client.key_exchange(public_key)
+    
+    while True:
+        print("\n  ╔══════════════════════════════════════════════════════════╗")
+        print("  ║           FRIENDS & MESSAGING                            ║")
+        print("  ╠══════════════════════════════════════════════════════════╣")
+        print("  ║  1. View Friends List                                    ║")
+        print("  ║  2. Add Friend                                           ║")
+        print("  ║  3. Friend Requests                                      ║")
+        print("  ║  4. Messages                                             ║")
+        print("  ║  5. Challenges                                           ║")
+        print("  ║  0. Back to Main Menu                                    ║")
+        print("  ╚══════════════════════════════════════════════════════════╝")
+        
+        try:
+            choice = input("  Choice: ").strip()
+        except EOFError:
+            return
+        
+        if choice == '0':
+            return
+        elif choice == '1':
+            view_friends_list()
+        elif choice == '2':
+            add_friend()
+        elif choice == '3':
+            friend_requests_menu()
+        elif choice == '4':
+            messages_menu()
+        elif choice == '5':
+            challenges_menu()
+        else:
+            print("  Invalid choice.")
+
+def view_friends_list():
+    """View list of friends."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║              YOUR FRIENDS                                ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    
+    response = _server_client.get_friend_list()
+    if not response or not response.get('success'):
+        print(f"  Error: {response.get('data', 'Unknown error') if response else 'No response'}")
+        return
+    
+    friends = response.get('data', {}).get('friends', [])
+    if not friends:
+        print("  You don't have any friends yet. Add some!")
+        return
+    
+    print(f"  {'Username':<20} {'Status':<10}")
+    print("  " + "-" * 30)
+    for friend in friends:
+        status = "Online" if friend.get('online') else "Offline"
+        print(f"  {friend['username']:<20} {status:<10}")
+    
+    print("\n  Actions:")
+    print("  M - Message a friend")
+    print("  C - Challenge a friend")
+    print("  R - Remove a friend")
+    print("  0 - Back")
+    
+    try:
+        action = input("  Action: ").strip().upper()
+    except EOFError:
+        return
+    
+    if action == '0':
+        return
+    elif action == 'M':
+        friend_name = input("  Friend's username: ").strip()
+        if friend_name:
+            open_chat_with_friend(friend_name)
+    elif action == 'C':
+        friend_name = input("  Friend's username: ").strip()
+        if friend_name:
+            challenge_friend(friend_name)
+    elif action == 'R':
+        friend_name = input("  Friend's username to remove: ").strip()
+        if friend_name:
+            response = _server_client.remove_friend(friend_name)
+            if response and response.get('success'):
+                print(f"  Friend '{friend_name}' removed.")
+            else:
+                print(f"  Error: {response.get('data', 'Unknown error') if response else 'Failed'}")
+
+def add_friend():
+    """Add a new friend."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║              ADD FRIEND                                  ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    
+    # First show list of users
+    response = _server_client.list_users()
+    if not response or not response.get('success'):
+        print("  Could not fetch user list.")
+        return
+    
+    users = response.get('data', [])
+    print("  Registered users:")
+    for user in sorted(users):
+        if user != _current_user:
+            print(f"    • {user}")
+    
+    friend_name = input("\n  Username to add: ").strip()
+    if not friend_name:
+        return
+    if friend_name == _current_user:
+        print("  Cannot add yourself as a friend!")
+        return
+    
+    response = _server_client.send_friend_request(friend_name)
+    if response and response.get('success'):
+        print(f"  Friend request sent to {friend_name}!")
+    else:
+        print(f"  Error: {response.get('data', 'Unknown error') if response else 'Failed'}")
+
+def friend_requests_menu():
+    """View and respond to friend requests."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║           FRIEND REQUESTS                                ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    
+    response = _server_client.get_friend_requests()
+    if not response or not response.get('success'):
+        print(f"  Error: {response.get('data', 'Unknown error') if response else 'No response'}")
+        return
+    
+    requests = response.get('data', {}).get('requests', [])
+    if not requests:
+        print("  No pending friend requests.")
+        return
+    
+    print("  Pending requests:")
+    for i, req in enumerate(requests, 1):
+        print(f"  {i}. From: {req['sender']}")
+    
+    print("\n  Enter request number to respond, or 0 to cancel:")
+    
+    try:
+        choice = input("  Choice: ").strip()
+    except EOFError:
+        return
+    
+    if choice == '0':
+        return
+    
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(requests):
+            sender = requests[idx]['sender']
+            print(f"\n  Respond to request from {sender}:")
+            print("  A - Accept")
+            print("  D - Decline")
+            action = input("  Action: ").strip().upper()
+            
+            if action == 'A':
+                response = _server_client.respond_to_friend_request(sender, True)
+                if response and response.get('success'):
+                    print(f"  Friend request from {sender} accepted!")
+            elif action == 'D':
+                response = _server_client.respond_to_friend_request(sender, False)
+                if response and response.get('success'):
+                    print(f"  Friend request from {sender} declined.")
+    except ValueError:
+        print("  Invalid choice.")
+
+def messages_menu():
+    """View and manage messages."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║              MESSAGES                                    ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    
+    # Get friends list
+    response = _server_client.get_friend_list()
+    if not response or not response.get('success'):
+        print("  Could not fetch friends list.")
+        return
+    
+    friends = response.get('data', {}).get('friends', [])
+    if not friends:
+        print("  You need friends before you can send messages!")
+        return
+    
+    print("  Friends you can message:")
+    for i, friend in enumerate(friends, 1):
+        print(f"  {i}. {friend['username']}")
+    
+    print("\n  Enter friend number to view messages, or 0 to cancel:")
+    
+    try:
+        choice = input("  Choice: ").strip()
+    except EOFError:
+        return
+    
+    if choice == '0':
+        return
+    
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(friends):
+            friend = friends[idx]['username']
+            open_chat_with_friend(friend)
+    except ValueError:
+        print("  Invalid choice.")
+
+def open_chat_with_friend(friend_name):
+    """Open a chat interface with a friend."""
+    print(f"\n  ╔══════════════════════════════════════════════════════════╗")
+    print(f"  ║  Chat with {friend_name:<36}║")
+    print(f"  ╚══════════════════════════════════════════════════════════╝")
+    
+    # Load existing messages
+    messages = []
+    last_message_id = 0
+    
+    response = _server_client.get_messages(friend_name)
+    if response and response.get('success'):
+        messages = response.get('data', {}).get('messages', [])
+        if messages:
+            last_message_id = messages[-1].get('id', 0)
+    
+    # Display messages
+    if messages:
+        print("\n  Recent messages:")
+        for msg in messages[-20:]:  # Show last 20 messages
+            sender = msg['sender']
+            # In a real implementation, decrypt the message
+            content = msg['encrypted_content'][:50] + "..." if len(msg['encrypted_content']) > 50 else msg['encrypted_content']
+            print(f"    [{sender}] {content}")
+        print()
+    
+    # Chat loop
+    while True:
+        try:
+            message = input(f"  Message to {friend_name} (or 'back' to return): ").strip()
+        except EOFError:
+            return
+        
+        if message.lower() == 'back':
+            return
+        if not message:
+            continue
+        
+        # Encrypt and send message
+        if friend_name in _user_public_keys:
+            encrypted, iv, tag = _encrypt_message(message, _user_public_keys[friend_name])
+        else:
+            # If we don't have the friend's key, use a demo key
+            encrypted, iv, tag = _encrypt_message(message, "demo_key")
+        
+        response = _server_client.send_message(friend_name, encrypted, iv, tag)
+        if response and response.get('success'):
+            print(f"  [You] {message}")
+        else:
+            print(f"  Error sending message: {response.get('data', 'Unknown error') if response else 'Failed'}")
+
+def challenges_menu():
+    """View and manage game challenges."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║              CHALLENGES                                  ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    
+    response = _server_client.get_challenges()
+    if not response or not response.get('success'):
+        print(f"  Error: {response.get('data', 'Unknown error') if response else 'No response'}")
+        return
+    
+    challenges = response.get('data', {}).get('challenges', [])
+    if not challenges:
+        print("  No pending challenges.")
+        print("\n  Actions:")
+        print("  N - Send new challenge")
+        print("  0 - Back")
+    else:
+        print("  Pending challenges:")
+        for i, chal in enumerate(challenges, 1):
+            challenger = chal['challenger']
+            challenged = chal['challenged']
+            is_from_me = challenger == _current_user
+            other_player = challenged if is_from_me else challenger
+            direction = "→" if is_from_me else "←"
+            print(f"  {i}. {direction} {other_player} ({chal['color_choice']}, {'rated' if chal['rated'] else 'unrated'})")
+        
+        print("\n  Actions:")
+        print("  Enter challenge number to respond")
+        print("  N - Send new challenge")
+        print("  0 - Back")
+    
+    try:
+        choice = input("  Choice: ").strip().upper()
+    except EOFError:
+        return
+    
+    if choice == '0':
+        return
+    elif choice == 'N':
+        # Get friend to challenge
+        response = _server_client.get_friend_list()
+        if response and response.get('success'):
+            friends = response.get('data', {}).get('friends', [])
+            if friends:
+                print("\n  Friends you can challenge:")
+                for i, friend in enumerate(friends, 1):
+                    print(f"  {i}. {friend['username']}")
+                
+                try:
+                    friend_choice = input("  Choice: ").strip()
+                    idx = int(friend_choice) - 1
+                    if 0 <= idx < len(friends):
+                        friend = friends[idx]['username']
+                        challenge_friend(friend)
+                except (ValueError, EOFError):
+                    pass
+    else:
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(challenges):
+                chal = challenges[idx]
+                is_from_me = chal['challenger'] == _current_user
+                other_player = chal['challenged'] if is_from_me else chal['challenger']
+                
+                if is_from_me:
+                    # Cancel challenge
+                    print(f"  Cancel challenge to {other_player}? [y/N]: ", end='')
+                    try:
+                        confirm = input().strip().lower()
+                    except EOFError:
+                        return
+                    if confirm == 'y':
+                        response = _server_client.cancel_challenge(other_player)
+                        if response and response.get('success'):
+                            print("  Challenge cancelled.")
+                else:
+                    # Respond to challenge
+                    print(f"\n  Respond to challenge from {other_player}:")
+                    print("  A - Accept")
+                    print("  D - Decline")
+                    try:
+                        action = input("  Action: ").strip().upper()
+                    except EOFError:
+                        return
+                    
+                    if action == 'A':
+                        response = _server_client.respond_to_challenge(other_player, True)
+                        if response and response.get('success'):
+                            print(f"  Challenge accepted! Starting game...")
+                            # The game will start automatically
+                    elif action == 'D':
+                        response = _server_client.respond_to_challenge(other_player, False)
+                        if response and response.get('success'):
+                            print("  Challenge declined.")
+        except ValueError:
+            print("  Invalid choice.")
+
+def challenge_friend(friend_name):
+    """Send a challenge to a friend."""
+    print(f"\n  ╔══════════════════════════════════════════════════════════╗")
+    print(f"  ║  Challenge {friend_name:<37}║")
+    print(f"  ╚══════════════════════════════════════════════════════════╝")
+    
+    print("  Color choice:")
+    print("  1. Random")
+    print("  2. White")
+    print("  3. Black")
+    
+    try:
+        color_choice = input("  Choice: ").strip()
+    except EOFError:
+        return
+    
+    color_map = {'1': 'random', '2': 'white', '3': 'black'}
+    color = color_map.get(color_choice, 'random')
+    
+    print("  Rated game? [Y/n]: ", end='')
+    try:
+        rated_choice = input().strip().lower()
+    except EOFError:
+        rated_choice = 'y'
+    rated = rated_choice != 'n'
+    
+    response = _server_client.send_challenge(friend_name, color, rated)
+    if response and response.get('success'):
+        print(f"  Challenge sent to {friend_name}!")
+    else:
+        print(f"  Error: {response.get('data', 'Unknown error') if response else 'Failed'}")
 
 def configure_server_connection():
     """Configure server host and port."""
@@ -3832,8 +4384,9 @@ MAIN_MENU_ONLINE = """
   │  5. ELO Leaderboard             │
   │  6. Analyze a PGN line          │
   │  7. Game Analysis (Online)      │
-  │  8. Configure Server            │
-  │  9. Enable Offline Mode         │
+  │  8. Friends & Messaging         │
+  │  9. Configure Server            │
+  │  0. Enable Offline Mode         │
   │  Q. Quit                        │
   └─────────────────────────────────┘
 """
@@ -3849,8 +4402,9 @@ MAIN_MENU_OFFLINE = """
   │  5. ELO Leaderboard             │
   │  6. Analyze a PGN line          │
   │  7. Game Analysis (Online)      │
-  │  8. Configure Server            │
-  │  9. Enable Online Mode          │
+  │  8. Friends & Messaging [OFFLINE]│
+  │  9. Configure Server            │
+  │  0. Enable Online Mode          │
   │  Q. Quit                        │
   └─────────────────────────────────┘
 """
@@ -4037,9 +4591,15 @@ def main():
             analyze_online_game_menu()
 
         elif choice=='8':
-            configure_server_connection()
+            if not _offline_mode:
+                friends_messaging_menu()
+            else:
+                print("\n  Feature not available in offline mode.")
 
         elif choice=='9':
+            configure_server_connection()
+
+        elif choice=='0':
             # Toggle offline mode
             if _offline_mode:
                 print("\n  ╔═══════════════════════════════════════════════════════════╗")
@@ -4068,7 +4628,7 @@ def main():
             else:
                 print("\n  ╔══════════════════════════════════════════════════════════╗")
                 print("  ║              ENABLE OFFLINE MODE?                         ║")
-                print("  ╠══════════════════════════════════════════════════════════╣")
+                print("  ╠═══════════════════════════════════════════════════════════╣")
                 print("  ║  This will disable:                                       ║")
                 print("  ║  • Online matchmaking                                     ║")
                 print("  ║  • User accounts and profiles                             ║")
