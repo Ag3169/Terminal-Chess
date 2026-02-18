@@ -2013,7 +2013,7 @@ class ChessClient:
 # Global authentication state
 _server_client = None
 _current_user = None
-_server_host = 'localhost'
+_server_host = '86.1.210.75'
 _server_port = 65433
 _offline_mode = True  # Start in offline mode by default
 
