@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║            CHESS SERVER — Terminal Chess Multiplayer Server              ║
+║            CHESS SERVER — Terminal Chess Multiplayer Server v2.0         ║
 ║                                                                          ║
 ║  Features:                                                               ║
 ║   • User authentication (register/login with username, password, email)  ║
-║   • User profile management                                              ║
-║   • Game history storage (past 3 games per user)                         ║
-║   • Profile viewing for other users                                      ║
-║   • TCP-based client/server communication                                ║
+║   • User profile management + ASCII avatars + bios                       ║
+║   • Game history storage (50 games per user) with full PGN               ║
+║   • ELO-banded matchmaking with time-control pairing                     ║
+║   • Disconnect-tolerant games (60s reconnect window)                     ║
+║   • Anti-cheat: move-time logging + bot-pattern flagging                 ║
+║   • Swiss-system tournament scheduler                                    ║
+║   • Server-queued post-game analysis jobs + daily puzzle endpoint        ║
+║   • Friend heartbeat (online/in-game/offline status every 30s)           ║
+║   • Lobby chat channel (global pre-game chat)                            ║
+║   • Achievement system (10 built-in achievements)                        ║
+║   • Rate limiting: max 5 failed logins per minute per IP                 ║
+║   • Structured JSON logging with log rotation                            ║
+║   • Expanded admin CLI (kick, ban, reset ELO, broadcast)                 ║
+║   • Config file support (chess_server.cfg)                               ║
+║   • TCP-based client/server communication with E2E encryption            ║
 ║   • JSON-based persistent database                                       ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
@@ -24,7 +35,13 @@ import time
 import secrets
 import base64
 import random
-from datetime import datetime
+import configparser
+import logging
+import logging.handlers
+import queue
+import itertools
+from collections import defaultdict
+from datetime import datetime, timedelta
 from hmac import compare_digest
 
 # ════════════════════════════════════════════════════════════════════════
@@ -225,16 +242,6 @@ def _aes_decrypt_block(block: bytes, key: bytes) -> bytes:
         s[3], s[7], s[11], s[15] = state[7], state[11], state[15], state[3]
         return s
     
-    def inv_mix_columns(state):
-        s = state[:]
-        for i in range(4):
-            a = s[i*4:(i+1)*4]
-            s[i*4] = (0x0e * a[0]) ^ (0x0b * a[1]) ^ (0x0d * a[2]) ^ (0x09 * a[3])
-            s[i*4+1] = (0x09 * a[0]) ^ (0x0e * a[1]) ^ (0x0b * a[2]) ^ (0x0d * a[3])
-            s[i*4+2] = (0x0d * a[0]) ^ (0x09 * a[1]) ^ (0x0e * a[2]) ^ (0x0b * a[3])
-            s[i*4+3] = (0x0b * a[0]) ^ (0x0d * a[1]) ^ (0x09 * a[2]) ^ (0x0e * a[3])
-        return s
-
     def add_round_key(state, round_key):
         return [s ^ k for s, k in zip(state, round_key)]
 
@@ -261,6 +268,26 @@ def _aes_decrypt_block(block: bytes, key: bytes) -> bytes:
             s[i*4+2] = gmul(0x0d, a[0]) ^ gmul(0x09, a[1]) ^ gmul(0x0e, a[2]) ^ gmul(0x0b, a[3])
             s[i*4+3] = gmul(0x0b, a[0]) ^ gmul(0x0d, a[1]) ^ gmul(0x09, a[2]) ^ gmul(0x0e, a[3])
         return s
+
+    # Forward S-box needed for key expansion (same as in encrypt)
+    SBOX = bytes([
+        0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+        0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+        0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+        0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+        0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+        0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+        0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+        0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+        0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+        0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+        0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+        0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+        0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+        0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+        0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+        0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+    ])
 
     def key_expansion(key):
         key_schedule = list(key)
@@ -437,9 +464,320 @@ def decrypt_credentials(encrypted_data: dict, server_private: int) -> dict:
 # ════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ════════════════════════════════════════════════════════════════════════
+
+# ── Server-side move legality tracker ───────────────────────────────────
+# A minimal FEN parser + move validator lives here so the server can reject
+# illegal moves from cheating clients without importing the full chess engine.
+# Strategy: maintain the FEN after every verified move; on each MSG_GAME_MOVE
+# reconstruct the board from FEN, generate pseudo-legal moves, and reject
+# moves not in that set.  This is lightweight but catches:
+#   • moving the wrong colour's piece
+#   • moving to an illegal square
+#   • moving when it's not your turn
+# Full legality (pins, check) is enforced by the client engine; the server
+# provides a second line of defence against modified/exploiting clients.
+
+PIECE_OFFSETS = {
+    'P': [], 'N': [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)],
+    'B': [], 'R': [], 'Q': [], 'K': [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+}
+INITIAL_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+def _sq(r, f):
+    """Square index from 0-row 0-col."""
+    if 0 <= r < 8 and 0 <= f < 8:
+        return r * 8 + f
+    return -1
+
+def _parse_fen(fen):
+    """Parse FEN into (board[64], side, castling, ep_sq, halfmove, fullmove)."""
+    parts = fen.split()
+    brd_str, side_ch, castle_str, ep_str = parts[0], parts[1], parts[2], parts[3]
+    halfmove = int(parts[4]) if len(parts) > 4 else 0
+    fullmove = int(parts[5]) if len(parts) > 5 else 1
+
+    board = [None] * 64
+    rank = 7
+    file = 0
+    for ch in brd_str:
+        if ch == '/':
+            rank -= 1; file = 0
+        elif ch.isdigit():
+            file += int(ch)
+        else:
+            board[rank * 8 + file] = ch
+            file += 1
+
+    side = 'w' if side_ch == 'w' else 'b'
+
+    ep_sq = -1
+    if ep_str != '-':
+        ep_sq = (ord(ep_str[1]) - ord('1')) * 8 + (ord(ep_str[0]) - ord('a'))
+
+    return board, side, castle_str, ep_sq, halfmove, fullmove
+
+def _board_to_fen(board, side, castling, ep_sq, halfmove, fullmove):
+    """Serialize board state back to FEN."""
+    rows = []
+    for rank in range(7, -1, -1):
+        row = ''; empty = 0
+        for file in range(8):
+            p = board[rank * 8 + file]
+            if p:
+                if empty: row += str(empty); empty = 0
+                row += p
+            else:
+                empty += 1
+        if empty: row += str(empty)
+        rows.append(row)
+    fen = '/'.join(rows)
+    ep = '-' if ep_sq < 0 else chr(ord('a') + ep_sq % 8) + chr(ord('1') + ep_sq // 8)
+    return f"{fen} {side} {castling or '-'} {ep} {halfmove} {fullmove}"
+
+def _server_pseudo_legal(board, side, castle_str, ep_sq):
+    """Generate pseudo-legal (from_sq, to_sq) pairs for the given side.
+    Pseudo-legal = correct piece movement, no check detection (handled client-side).
+    """
+    moves = []
+    my_pieces = str.upper if side == 'w' else str.lower
+    opp_colour = 'b' if side == 'w' else 'w'
+    pawn_dir   = 1  if side == 'w' else -1
+    pawn_start = 1  if side == 'w' else 6
+    prom_rank  = 7  if side == 'w' else 0
+
+    def is_mine(p):  return p is not None and (p.isupper() if side == 'w' else p.islower())
+    def is_opp(p):   return p is not None and (p.islower() if side == 'w' else p.isupper())
+    def is_empty(sq): return 0 <= sq < 64 and board[sq] is None
+
+    for sq in range(64):
+        p = board[sq]
+        if not is_mine(p): continue
+        pt = p.upper()
+        r, f = sq // 8, sq % 8
+
+        if pt == 'P':
+            fwd = _sq(r + pawn_dir, f)
+            if 0 <= fwd < 64 and board[fwd] is None:
+                moves.append((sq, fwd))
+                if r == pawn_start:
+                    fwd2 = _sq(r + 2 * pawn_dir, f)
+                    if board[fwd2] is None:
+                        moves.append((sq, fwd2))
+            for df in (-1, 1):
+                cap = _sq(r + pawn_dir, f + df)
+                if 0 <= cap < 64:
+                    if is_opp(board[cap]) or cap == ep_sq:
+                        moves.append((sq, cap))
+
+        elif pt == 'N':
+            for dr, df in PIECE_OFFSETS['N']:
+                t = _sq(r + dr, f + df)
+                if t >= 0 and not is_mine(board[t]):
+                    moves.append((sq, t))
+
+        elif pt in ('B', 'R', 'Q'):
+            dirs = []
+            if pt in ('B', 'Q'): dirs += [(-1,-1),(-1,1),(1,-1),(1,1)]
+            if pt in ('R', 'Q'): dirs += [(-1,0),(1,0),(0,-1),(0,1)]
+            for dr, df in dirs:
+                nr, nf = r + dr, f + df
+                while 0 <= nr < 8 and 0 <= nf < 8:
+                    t = nr * 8 + nf
+                    if is_mine(board[t]): break
+                    moves.append((sq, t))
+                    if is_opp(board[t]): break
+                    nr += dr; nf += df
+
+        elif pt == 'K':
+            for dr, df in PIECE_OFFSETS['K']:
+                t = _sq(r + dr, f + df)
+                if t >= 0 and not is_mine(board[t]):
+                    moves.append((sq, t))
+            # Castling
+            king_sq = 4 if side == 'w' else 60
+            if sq == king_sq:
+                if side == 'w':
+                    if 'K' in castle_str and board[5] is None and board[6] is None:
+                        moves.append((sq, 6))
+                    if 'Q' in castle_str and board[3] is None and board[2] is None and board[1] is None:
+                        moves.append((sq, 2))
+                else:
+                    if 'k' in castle_str and board[61] is None and board[62] is None:
+                        moves.append((sq, 62))
+                    if 'q' in castle_str and board[59] is None and board[58] is None and board[57] is None:
+                        moves.append((sq, 58))
+    return moves
+
+def _apply_server_move(board, side, castle_str, ep_sq, halfmove, fullmove, from_sq, to_sq, promote_to='q'):
+    """Apply a validated move and return new FEN fields."""
+    new_board = board[:]
+    p = new_board[from_sq]
+    pt = p.upper() if p else ''
+    captured = new_board[to_sq]
+    new_ep = -1
+    new_castle = castle_str
+
+    # En passant capture
+    if pt == 'P' and to_sq == ep_sq:
+        ep_capture = ep_sq + (-8 if side == 'w' else 8)
+        new_board[ep_capture] = None
+
+    # Pawn double push -> set ep square
+    if pt == 'P' and abs(to_sq - from_sq) == 16:
+        new_ep = (from_sq + to_sq) // 2
+
+    # Castling: move rook
+    if pt == 'K':
+        if from_sq == 4 and to_sq == 6:   new_board[5] = 'R'; new_board[7] = None
+        if from_sq == 4 and to_sq == 2:   new_board[3] = 'R'; new_board[0] = None
+        if from_sq == 60 and to_sq == 62: new_board[61] = 'r'; new_board[63] = None
+        if from_sq == 60 and to_sq == 58: new_board[59] = 'r'; new_board[56] = None
+        new_castle = new_castle.replace('K','').replace('Q','') if side=='w' else new_castle.replace('k','').replace('q','')
+
+    # Pawn promotion
+    if pt == 'P' and (to_sq // 8 == 7 or to_sq // 8 == 0):
+        p = (promote_to.upper() if side == 'w' else promote_to.lower())
+
+    # Rook moves strip castling rights
+    if from_sq == 0:  new_castle = new_castle.replace('Q','')
+    if from_sq == 7:  new_castle = new_castle.replace('K','')
+    if from_sq == 56: new_castle = new_castle.replace('q','')
+    if from_sq == 63: new_castle = new_castle.replace('k','')
+
+    new_board[to_sq] = p
+    new_board[from_sq] = None
+
+    # Halfmove clock
+    new_half = 0 if (pt == 'P' or captured) else halfmove + 1
+    new_full = fullmove + (1 if side == 'b' else 0)
+    new_side = 'b' if side == 'w' else 'w'
+
+    return new_board, new_side, new_castle or '-', new_ep, new_half, new_full
+
+def _san_to_squares(san, board, side, castle_str, ep_sq):
+    """Convert SAN move string to (from_sq, to_sq, promote_to).
+    Returns None if no match found in pseudo-legal moves.
+    """
+    import re
+    san_clean = san.rstrip('+#')
+    promote_to = 'q'
+
+    # Castling
+    if san_clean in ('O-O', '0-0'):
+        king_sq = 4 if side == 'w' else 60
+        return king_sq, king_sq + 2, 'q'
+    if san_clean in ('O-O-O', '0-0-0'):
+        king_sq = 4 if side == 'w' else 60
+        return king_sq, king_sq - 2, 'q'
+
+    # Promotion suffix (e.g. e8=Q or e8Q)
+    promo_match = re.search(r'[=]?([QRBN])$', san_clean, re.IGNORECASE)
+    if promo_match:
+        promote_to = promo_match.group(1).lower()
+        san_clean = san_clean[:promo_match.start()]
+
+    # Coordinate notation: e2e4 or e2-e4
+    coord_match = re.match(r'^([a-h][1-8])[-]?([a-h][1-8])$', san_clean)
+    if coord_match:
+        def alg_to_sq(s): return (int(s[1])-1)*8 + (ord(s[0])-ord('a'))
+        return alg_to_sq(coord_match.group(1)), alg_to_sq(coord_match.group(2)), promote_to
+
+    # SAN parsing: piece letter + optional disambiguation + optional x + dest
+    m = re.match(r'^([NBRQK]?)([a-h]?)([1-8]?)(x?)([a-h][1-8])$', san_clean)
+    if not m:
+        return None
+    piece_ch, file_hint, rank_hint, _, dest = m.groups()
+    to_sq = (int(dest[1])-1)*8 + (ord(dest[0])-ord('a'))
+    piece_type = (piece_ch or 'P').upper()
+    if not piece_ch:
+        piece_type = 'P'
+
+    candidates = []
+    for fsq, tsq in _server_pseudo_legal(board, side, castle_str, ep_sq):
+        if tsq != to_sq: continue
+        p = board[fsq]
+        if p is None: continue
+        if p.upper() != piece_type: continue
+        fr, ff = fsq // 8, fsq % 8
+        if file_hint and chr(ord('a') + ff) != file_hint: continue
+        if rank_hint and str(fr + 1) != rank_hint: continue
+        candidates.append((fsq, tsq))
+
+    if len(candidates) == 1:
+        return candidates[0][0], candidates[0][1], promote_to
+    if len(candidates) > 1:
+        return candidates[0][0], candidates[0][1], promote_to   # ambiguous but allow
+    return None
+
 SERVER_PORT = 65433
 DATABASE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'database.json')
-MAX_GAMES_PER_USER = 3
+MAX_GAMES_PER_USER = 50   # raised from 3
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chess_server.log')
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chess_server.cfg')
+
+# ════════════════════════════════════════════════════════════════════════
+#  CONFIG FILE LOADER
+# ════════════════════════════════════════════════════════════════════════
+def _load_config():
+    """Load server configuration from chess_server.cfg, or use defaults."""
+    cfg = configparser.ConfigParser()
+    defaults = {
+        'port': str(SERVER_PORT),
+        'host': '0.0.0.0',
+        'max_clients': '100',
+        'log_level': 'INFO',
+        'log_max_bytes': '5242880',   # 5 MB
+        'log_backup_count': '5',
+        'max_failed_logins_per_min': '5',
+        'disconnect_grace_seconds': '60',
+        'heartbeat_interval': '30',
+        'analysis_queue_workers': '1',
+    }
+    cfg['server'] = defaults
+    if os.path.exists(CONFIG_FILE):
+        cfg.read(CONFIG_FILE)
+    else:
+        # Write default config so admins can see/edit it
+        with open(CONFIG_FILE, 'w') as f:
+            cfg.write(f)
+    return cfg['server']
+
+_cfg = _load_config()
+
+# ════════════════════════════════════════════════════════════════════════
+#  STRUCTURED JSON LOGGER WITH ROTATION
+# ════════════════════════════════════════════════════════════════════════
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'level': record.levelname,
+            'msg': record.getMessage(),
+        }
+        if record.exc_info:
+            log_obj['exc'] = self.formatException(record.exc_info)
+        return json.dumps(log_obj)
+
+def _setup_logger():
+    logger = logging.getLogger('chess_server')
+    level = getattr(logging, _cfg.get('log_level', 'INFO').upper(), logging.INFO)
+    logger.setLevel(level)
+    # Rotating file handler
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=int(_cfg.get('log_max_bytes', 5242880)),
+        backupCount=int(_cfg.get('log_backup_count', 5))
+    )
+    fh.setFormatter(_JsonFormatter())
+    logger.addHandler(fh)
+    # Console handler (plain text)
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('  %(levelname)s %(message)s'))
+    logger.addHandler(ch)
+    return logger
+
+log = _setup_logger()
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  MESSAGE TYPES
@@ -493,6 +831,64 @@ MSG_CHALLENGE_CANCEL = 'CHALLENGE_CANCEL'
 MSG_GET_SERVER_PUBLIC_KEY = 'GET_SERVER_PUBLIC_KEY'
 MSG_SESSION_KEY_EXCHANGE = 'SESSION_KEY_EXCHANGE'
 
+# Spectator message types
+MSG_SPECTATE_JOIN = 'SPECTATE_JOIN'
+MSG_SPECTATE_LEAVE = 'SPECTATE_LEAVE'
+MSG_SPECTATE_LIST = 'SPECTATE_LIST'
+MSG_SPECTATE_UPDATE = 'SPECTATE_UPDATE'
+
+# Rematch message types
+MSG_REMATCH_REQUEST = 'REMATCH_REQUEST'
+MSG_REMATCH_RESPONSE = 'REMATCH_RESPONSE'
+
+# Game clock message types
+MSG_GAME_CLOCK_UPDATE = 'GAME_CLOCK_UPDATE'
+MSG_GAME_TIMEOUT = 'GAME_TIMEOUT'
+
+# Player profile / avatar message types
+MSG_SET_AVATAR = 'SET_AVATAR'
+MSG_GET_AVATAR = 'GET_AVATAR'
+
+# Chat history message type
+MSG_GAME_CHAT_HISTORY = 'GAME_CHAT_HISTORY'
+
+# ── New message types (v2.0) ─────────────────────────────────────────────
+# Lobby chat
+MSG_LOBBY_CHAT = 'LOBBY_CHAT'
+MSG_LOBBY_CHAT_HISTORY = 'LOBBY_CHAT_HISTORY'
+
+# Friend heartbeat / status
+MSG_FRIEND_HEARTBEAT = 'FRIEND_HEARTBEAT'
+
+# Daily puzzle
+MSG_DAILY_PUZZLE = 'DAILY_PUZZLE'
+
+# Post-game analysis job
+MSG_ANALYSIS_REQUEST = 'ANALYSIS_REQUEST'
+MSG_ANALYSIS_RESULT  = 'ANALYSIS_RESULT'
+
+# Achievements
+MSG_ACHIEVEMENTS = 'ACHIEVEMENTS'
+MSG_ACHIEVEMENT_UNLOCKED = 'ACHIEVEMENT_UNLOCKED'
+
+# Tournament
+MSG_TOURNAMENT_CREATE   = 'TOURNAMENT_CREATE'
+MSG_TOURNAMENT_JOIN     = 'TOURNAMENT_JOIN'
+MSG_TOURNAMENT_LIST     = 'TOURNAMENT_LIST'
+MSG_TOURNAMENT_STATUS   = 'TOURNAMENT_STATUS'
+MSG_TOURNAMENT_PAIRINGS = 'TOURNAMENT_PAIRINGS'
+MSG_TOURNAMENT_RESULT   = 'TOURNAMENT_RESULT'
+
+# Disconnect/reconnect
+MSG_RECONNECT = 'RECONNECT'
+
+# Admin commands (server-side only, not from client)
+MSG_ADMIN_KICK      = 'ADMIN_KICK'
+MSG_ADMIN_BAN       = 'ADMIN_BAN'
+MSG_ADMIN_RESET_ELO = 'ADMIN_RESET_ELO'
+MSG_ADMIN_BROADCAST = 'ADMIN_BROADCAST'
+MSG_SERVER_BROADCAST = 'SERVER_BROADCAST'   # Sent to all clients
+
 # Response types
 RESP_SUCCESS = 'SUCCESS'
 RESP_ERROR = 'ERROR'
@@ -512,6 +908,7 @@ class DatabaseManager:
         self.db_file = db_file
         self.lock = threading.Lock()
         self._message_id_counter = 0  # Thread-safe counter for message IDs
+        self._failed_logins = defaultdict(list)  # ip -> [timestamp, ...]  (rate limiting)
         self._init_db()
     
     def _init_db(self):
@@ -523,7 +920,12 @@ class DatabaseManager:
                 "friend_requests": [],
                 "friendships": [],
                 "messages": [],
-                "challenges": []
+                "challenges": [],
+                "game_chat_history": {},
+                "tournaments": {},
+                "lobby_chat": [],
+                "daily_puzzle": None,
+                "achievements": {},  # username -> [achievement_ids]
             })
         else:
             # Initialize message ID counter from existing messages
@@ -531,6 +933,34 @@ class DatabaseManager:
             messages = db.get('messages', [])
             if messages:
                 self._message_id_counter = max(msg.get('id', 0) for msg in messages)
+            # Migrate: add new collections/fields if missing
+            changed = False
+            for key, default in [
+                ('game_chat_history', {}),
+                ('tournaments', {}),
+                ('lobby_chat', []),
+                ('daily_puzzle', None),
+                ('achievements', {}),
+            ]:
+                if key not in db:
+                    db[key] = default
+                    changed = True
+            for username, udata in db.get('users', {}).items():
+                for field, default in [
+                    ('avatar', ''),
+                    ('bio', ''),
+                    ('elo_floor', 100),
+                    ('is_provisional', udata.get('elo_games', 0) < 20),
+                    ('banned', False),
+                    ('move_times', []),   # anti-cheat: last N move durations
+                    ('suspicious_games', 0),
+                ]:
+                    if field not in udata:
+                        udata[field] = default
+                        changed = True
+            if changed:
+                self._save_db(db)
+
     
     def _load_db(self):
         """Load database from file."""
@@ -603,13 +1033,31 @@ class DatabaseManager:
                 'elo_wins': 0,
                 'elo_losses': 0,
                 'elo_draws': 0,
-                'elo_peak': 1200
+                'elo_peak': 1200,
+                'elo_floor': 100,        # Rating floor
+                'is_provisional': True,   # Provisional for first 20 games
+                'avatar': '',             # ASCII art avatar (up to 500 chars)
+                'bio': ''                 # Short bio (up to 200 chars)
             }
 
             self._save_db(db)
             return True, "Registration successful"
     
-    def authenticate_user(self, username, password):
+    def check_login_rate_limit(self, ip_address):
+        """Return True if this IP has exceeded max failed logins per minute."""
+        max_fails = int(_cfg.get('max_failed_logins_per_min', 5))
+        now = time.time()
+        window = 60.0
+        attempts = self._failed_logins[ip_address]
+        # Prune old attempts
+        self._failed_logins[ip_address] = [t for t in attempts if now - t < window]
+        return len(self._failed_logins[ip_address]) >= max_fails
+
+    def record_failed_login(self, ip_address):
+        """Record a failed login attempt for rate limiting."""
+        self._failed_logins[ip_address].append(time.time())
+
+    def authenticate_user(self, username, password, ip_address=''):
         """
         Authenticate user login.
         Returns (success, message) tuple.
@@ -618,13 +1066,21 @@ class DatabaseManager:
             db = self._load_db()
 
             if username not in db['users']:
+                if ip_address:
+                    self.record_failed_login(ip_address)
                 return False, "Invalid username or password"
+
+            if db['users'][username].get('banned', False):
+                return False, "Account has been banned"
 
             password_hash = self._hash_password(password)
             if db['users'][username]['password_hash'] != password_hash:
+                if ip_address:
+                    self.record_failed_login(ip_address)
                 return False, "Invalid username or password"
 
             return True, "Login successful"
+
 
     def authenticate_user_with_hash(self, username, password_hash):
         """
@@ -642,10 +1098,11 @@ class DatabaseManager:
 
             return True, "Auto-login successful"
     
-    def get_user_profile(self, username):
+    def get_user_profile(self, username, page=0, page_size=10):
         """
         Get user profile information.
         Returns profile dict or None if user doesn't exist.
+        page/page_size control which slice of game history is returned.
         """
         with self.lock:
             db = self._load_db()
@@ -655,13 +1112,15 @@ class DatabaseManager:
 
             user_data = db['users'][username]
 
-            # Get user's last 3 games
+            # Get user's games — newest first — with pagination
             user_games = [
                 g for g in db['game_history']
                 if g['white'] == username or g['black'] == username
             ]
             user_games.sort(key=lambda x: x['timestamp'], reverse=True)
-            recent_games = user_games[:MAX_GAMES_PER_USER]
+            total_games = len(user_games)
+            start = page * page_size
+            recent_games = user_games[start:start + page_size]
 
             return {
                 'username': username,
@@ -677,8 +1136,14 @@ class DatabaseManager:
                 'elo_losses': user_data.get('elo_losses', 0),
                 'elo_draws': user_data.get('elo_draws', 0),
                 'elo_peak': user_data.get('elo_peak', 1200),
-                'recent_games': recent_games
+                'banned': user_data.get('banned', False),
+                'suspicious_games': user_data.get('suspicious_games', 0),
+                'recent_games': recent_games,
+                'total_game_count': total_games,
+                'page': page,
+                'page_size': page_size,
             }
+
     
     def _calculate_elo_change(self, rating_a, rating_b, result_a, k_factor=32):
         """
@@ -710,27 +1175,39 @@ class DatabaseManager:
         else:
             return 16  # Lowest K for masters
 
-    def save_game(self, white, black, result, moves, duration=0, rated=True):
+    def save_game(self, white, black, result, moves, duration=0, rated=True, pgn='', move_times=None):
         """
         Save a game to history.
         Result: 'white', 'black', or 'draw'
         If rated=True, also update ELO ratings.
+        pgn: optional full PGN string for permanent storage.
+        move_times: list of (player, elapsed_seconds) for anti-cheat analysis.
         """
         with self.lock:
             db = self._load_db()
 
+            # Use a proper unique ID
+            existing_ids = [g.get('id', 0) for g in db['game_history']]
+            new_id = max(existing_ids, default=0) + 1
+
             game_record = {
-                'id': len(db['game_history']) + 1,
+                'id': new_id,
                 'timestamp': datetime.now().isoformat(),
                 'white': white,
                 'black': black,
                 'result': result,
                 'moves': moves,
+                'pgn': pgn,
                 'duration': duration,
-                'rated': rated
+                'rated': rated,
+                'move_times': move_times or [],
             }
 
             db['game_history'].append(game_record)
+
+            # Prune global history to last 10000 games to avoid unbounded growth
+            if len(db['game_history']) > 10000:
+                db['game_history'] = db['game_history'][-10000:]
 
             elo_changes = {}  # Store ELO changes to return
 
@@ -754,15 +1231,23 @@ class DatabaseManager:
                             db['users'][username]['elo_draws'] += 1
                         else:
                             db['users'][username]['elo_losses'] += 1
+
+                    # Anti-cheat: log move times and flag suspicious patterns
+                    if move_times:
+                        player_times = [t for (p, t) in move_times if p == username]
+                        if player_times:
+                            fast_moves = sum(1 for t in player_times if t < 0.5)
+                            if len(player_times) >= 5 and fast_moves / len(player_times) > 0.6:
+                                db['users'][username]['suspicious_games'] = db['users'][username].get('suspicious_games', 0) + 1
+                                log.warning(f"Anti-cheat: {username} flagged ({fast_moves}/{len(player_times)} fast moves in game {new_id})")
                 else:
-                    print(f"  [DB] Warning: User {username} not found in database!", flush=True)
+                    log.warning(f"[DB] User {username} not found in database!")
 
             # Calculate and apply ELO changes
             if rated and white in db['users'] and black in db['users']:
                 white_elo = db['users'][white]['elo']
                 black_elo = db['users'][black]['elo']
 
-                # Determine result from white's perspective
                 if result == 'white':
                     white_result = 1.0
                 elif result == 'black':
@@ -770,26 +1255,29 @@ class DatabaseManager:
                 else:
                     white_result = 0.5
 
-                # Get K-factors
                 white_k = self._get_k_factor(white_elo, db['users'][white]['elo_games'])
                 black_k = self._get_k_factor(black_elo, db['users'][black]['elo_games'])
 
-                # Calculate expected scores
                 white_expected = 1.0 / (1.0 + 10 ** ((black_elo - white_elo) / 400.0))
                 black_expected = 1.0 / (1.0 + 10 ** ((white_elo - black_elo) / 400.0))
 
-                # Calculate changes
                 white_change = round(white_k * (white_result - white_expected))
                 black_change = round(black_k * ((1 - white_result) - black_expected))
 
-                # Apply changes
                 new_white_elo = white_elo + white_change
                 new_black_elo = black_elo + black_change
 
                 db['users'][white]['elo'] = new_white_elo
                 db['users'][black]['elo'] = new_black_elo
 
-                # Update peak ELO
+                white_floor = db['users'][white].get('elo_floor', 100)
+                black_floor = db['users'][black].get('elo_floor', 100)
+                db['users'][white]['elo'] = max(new_white_elo, white_floor)
+                db['users'][black]['elo'] = max(new_black_elo, black_floor)
+
+                db['users'][white]['is_provisional'] = db['users'][white]['elo_games'] < 20
+                db['users'][black]['is_provisional'] = db['users'][black]['elo_games'] < 20
+
                 if new_white_elo > db['users'][white]['elo_peak']:
                     db['users'][white]['elo_peak'] = new_white_elo
                 if new_black_elo > db['users'][black]['elo_peak']:
@@ -805,6 +1293,7 @@ class DatabaseManager:
             if rated:
                 return True, elo_changes
             return True, None
+
     
     def list_users(self):
         """Get list of all usernames."""
@@ -825,7 +1314,10 @@ class DatabaseManager:
                     'wins': data.get('elo_wins', 0),
                     'losses': data.get('elo_losses', 0),
                     'draws': data.get('elo_draws', 0),
-                    'peak': data.get('elo_peak', 1200)
+                    'peak': data.get('elo_peak', 1200),
+                    'is_provisional': data.get('is_provisional', data.get('elo_games', 0) < 20),
+                    'avatar': data.get('avatar', ''),
+                    'bio': data.get('bio', '')
                 })
             # Sort by ELO descending
             users.sort(key=lambda x: (-x['elo'], -x['games']))
@@ -956,15 +1448,10 @@ class DatabaseManager:
     #  MESSAGING SYSTEM METHODS
     # ════════════════════════════════════════════════════════════════════
     def store_message(self, sender, recipient, encrypted_content, iv, tag):
-        """Store an encrypted message."""
+        """Store an encrypted message. Caller must verify friendship before calling."""
         with self.lock:
             db = self._load_db()
 
-            # Verify users are friends
-            if not self.are_friends(sender, recipient):
-                return False, "Users are not friends"
-
-            from datetime import timedelta
             # Use thread-safe counter for message ID
             self._message_id_counter += 1
             message_id = self._message_id_counter
@@ -987,9 +1474,14 @@ class DatabaseManager:
         """Get messages between two users."""
         with self.lock:
             db = self._load_db()
-            
-            # Verify users are friends
-            if not self.are_friends(user1, user2):
+
+            # Inline friendship check (cannot call self.are_friends here — same lock)
+            is_friends = any(
+                (f['user1'] == user1 and f['user2'] == user2) or
+                (f['user1'] == user2 and f['user2'] == user1)
+                for f in db.get('friendships', [])
+            )
+            if not is_friends:
                 return []
             
             messages = []
@@ -1039,8 +1531,13 @@ class DatabaseManager:
             if challenger == challenged:
                 return False, "Cannot challenge yourself"
             
-            # Verify users are friends
-            if not self.are_friends(challenger, challenged):
+            # Verify users are friends (inline to avoid re-acquiring the lock)
+            is_friends = any(
+                (f['user1'] == challenger and f['user2'] == challenged) or
+                (f['user1'] == challenged and f['user2'] == challenger)
+                for f in db.get('friendships', [])
+            )
+            if not is_friends:
                 return False, "Can only challenge friends"
             
             # Check for existing active challenge
@@ -1141,6 +1638,360 @@ class DatabaseManager:
             
             return False, "Challenge not found"
 
+    # ════════════════════════════════════════════════════════════════════
+    #  AVATAR / PROFILE METHODS
+    # ════════════════════════════════════════════════════════════════════
+    def set_avatar(self, username, avatar, bio):
+        """Set a user's ASCII avatar and bio."""
+        with self.lock:
+            db = self._load_db()
+            if username not in db['users']:
+                return False, "User not found"
+            db['users'][username]['avatar'] = avatar[:500]
+            db['users'][username]['bio'] = bio[:200]
+            self._save_db(db)
+            return True, "Profile updated"
+
+    def get_avatar(self, username):
+        """Get a user's avatar and bio."""
+        with self.lock:
+            db = self._load_db()
+            if username not in db['users']:
+                return None
+            udata = db['users'][username]
+            return {
+                'username': username,
+                'avatar': udata.get('avatar', ''),
+                'bio': udata.get('bio', ''),
+                'elo': udata.get('elo', 1200),
+                'games': udata.get('elo_games', 0),
+                'wins': udata.get('wins', 0),
+                'losses': udata.get('losses', 0),
+                'draws': udata.get('draws', 0),
+                'is_provisional': udata.get('is_provisional', udata.get('elo_games', 0) < 20),
+                'elo_peak': udata.get('elo_peak', 1200)
+            }
+
+    # ════════════════════════════════════════════════════════════════════
+    #  GAME CHAT HISTORY METHODS
+    # ════════════════════════════════════════════════════════════════════
+    def save_game_chat(self, game_id, chat_log):
+        """Persist game chat log (keeps last 100 games)."""
+        with self.lock:
+            db = self._load_db()
+            if 'game_chat_history' not in db:
+                db['game_chat_history'] = {}
+            db['game_chat_history'][str(game_id)] = chat_log
+            # Prune to last 100 games
+            if len(db['game_chat_history']) > 100:
+                oldest = sorted(db['game_chat_history'].keys())[0]
+                del db['game_chat_history'][oldest]
+            self._save_db(db)
+
+    def get_game_chat(self, game_id):
+        """Retrieve chat log for a game."""
+        with self.lock:
+            db = self._load_db()
+            return db.get('game_chat_history', {}).get(str(game_id), [])
+
+    def get_game_pgn(self, game_id):
+        """Retrieve stored PGN for a game by ID."""
+        with self.lock:
+            db = self._load_db()
+            for g in db['game_history']:
+                if g.get('id') == game_id:
+                    return g.get('pgn', '')
+            return None
+
+    # ════════════════════════════════════════════════════════════════════
+    #  ADMIN METHODS
+    # ════════════════════════════════════════════════════════════════════
+    def ban_user(self, username):
+        """Ban a user account."""
+        with self.lock:
+            db = self._load_db()
+            if username not in db['users']:
+                return False, "User not found"
+            db['users'][username]['banned'] = True
+            self._save_db(db)
+            log.warning(f"Admin: user '{username}' BANNED")
+            return True, f"User '{username}' banned"
+
+    def unban_user(self, username):
+        """Unban a user account."""
+        with self.lock:
+            db = self._load_db()
+            if username not in db['users']:
+                return False, "User not found"
+            db['users'][username]['banned'] = False
+            self._save_db(db)
+            log.info(f"Admin: user '{username}' unbanned")
+            return True, f"User '{username}' unbanned"
+
+    def reset_elo(self, username, new_elo=1200):
+        """Reset a user's ELO rating."""
+        with self.lock:
+            db = self._load_db()
+            if username not in db['users']:
+                return False, "User not found"
+            db['users'][username]['elo'] = new_elo
+            db['users'][username]['elo_peak'] = max(new_elo, db['users'][username].get('elo_peak', new_elo))
+            db['users'][username]['is_provisional'] = True
+            self._save_db(db)
+            log.info(f"Admin: ELO for '{username}' reset to {new_elo}")
+            return True, f"ELO for '{username}' reset to {new_elo}"
+
+    # ════════════════════════════════════════════════════════════════════
+    #  ACHIEVEMENT SYSTEM
+    # ════════════════════════════════════════════════════════════════════
+    ACHIEVEMENTS = {
+        'first_win':      {'name': 'First Blood',    'desc': 'Win your first game'},
+        'ten_wins':       {'name': 'On a Roll',      'desc': 'Win 10 games'},
+        'fifty_wins':     {'name': 'Veteran',         'desc': 'Win 50 games'},
+        'first_draw':     {'name': 'Diplomat',        'desc': 'Draw your first game'},
+        'streak_5':       {'name': 'Hot Streak',      'desc': 'Win 5 games in a row'},
+        'elo_1500':       {'name': 'Club Player',     'desc': 'Reach 1500 ELO'},
+        'elo_1800':       {'name': 'Expert',          'desc': 'Reach 1800 ELO'},
+        'elo_2000':       {'name': 'Master Class',    'desc': 'Reach 2000 ELO'},
+        'played_100':     {'name': 'Centurion',       'desc': 'Play 100 rated games'},
+        'comeback':       {'name': 'Never Give Up',   'desc': 'Win a game from a losing ELO'},
+    }
+
+    def check_and_award_achievements(self, username):
+        """Check achievements for a user after a game; returns list of newly unlocked ids."""
+        with self.lock:
+            db = self._load_db()
+            if username not in db['users']:
+                return []
+            udata = db['users'][username]
+            if 'achievements' not in db:
+                db['achievements'] = {}
+            unlocked = set(db['achievements'].get(username, []))
+            new_unlocks = []
+
+            wins    = udata.get('wins', 0)
+            draws   = udata.get('draws', 0)
+            elo     = udata.get('elo', 1200)
+            games   = udata.get('elo_games', 0)
+
+            checks = [
+                ('first_win',  wins >= 1),
+                ('ten_wins',   wins >= 10),
+                ('fifty_wins', wins >= 50),
+                ('first_draw', draws >= 1),
+                ('elo_1500',   elo >= 1500),
+                ('elo_1800',   elo >= 1800),
+                ('elo_2000',   elo >= 2000),
+                ('played_100', games >= 100),
+            ]
+            for ach_id, condition in checks:
+                if condition and ach_id not in unlocked:
+                    unlocked.add(ach_id)
+                    new_unlocks.append(ach_id)
+
+            if new_unlocks:
+                db['achievements'][username] = list(unlocked)
+                self._save_db(db)
+            return new_unlocks
+
+    def get_achievements(self, username):
+        """Get list of achievement dicts for a user."""
+        with self.lock:
+            db = self._load_db()
+            unlocked = set(db.get('achievements', {}).get(username, []))
+            result = []
+            for ach_id, info in self.ACHIEVEMENTS.items():
+                result.append({
+                    'id': ach_id,
+                    'name': info['name'],
+                    'desc': info['desc'],
+                    'unlocked': ach_id in unlocked,
+                })
+            return result
+
+    # ════════════════════════════════════════════════════════════════════
+    #  LOBBY CHAT
+    # ════════════════════════════════════════════════════════════════════
+    def add_lobby_message(self, sender, message):
+        """Add a message to the global lobby chat (keep last 200)."""
+        with self.lock:
+            db = self._load_db()
+            if 'lobby_chat' not in db:
+                db['lobby_chat'] = []
+            db['lobby_chat'].append({
+                'sender': sender,
+                'message': message[:500],
+                'ts': datetime.now().isoformat(),
+            })
+            db['lobby_chat'] = db['lobby_chat'][-200:]
+            self._save_db(db)
+
+    def get_lobby_chat(self, limit=50):
+        """Get recent lobby chat messages."""
+        with self.lock:
+            db = self._load_db()
+            msgs = db.get('lobby_chat', [])
+            return msgs[-limit:]
+
+    # ════════════════════════════════════════════════════════════════════
+    #  DAILY PUZZLE
+    # ════════════════════════════════════════════════════════════════════
+    def get_or_generate_daily_puzzle(self):
+        """Return today's puzzle; generate a new one if the date has changed."""
+        with self.lock:
+            db = self._load_db()
+            today = datetime.now().strftime('%Y-%m-%d')
+            puzzle = db.get('daily_puzzle')
+            if puzzle and puzzle.get('date') == today:
+                return puzzle
+
+            # Pick a random position from game history as puzzle source
+            # In practice you'd use a curated puzzle DB; here we create a
+            # plausible puzzle record from stored game positions.
+            SAMPLE_PUZZLES = [
+                {'fen': 'r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4',
+                 'moves': 'Ng5', 'theme': 'Fried Liver Attack', 'rating': 1400},
+                {'fen': '8/8/8/8/8/4k3/4p3/4K3 b - - 0 1',
+                 'moves': 'e1=Q+', 'theme': 'Promotion', 'rating': 900},
+                {'fen': 'r1b1kb1r/ppp2ppp/2n5/3qp3/2B5/2N2N2/PPPP1PPP/R1BQK2R b KQkq - 0 7',
+                 'moves': 'Qxf3', 'theme': 'Fork', 'rating': 1200},
+                {'fen': '6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1',
+                 'moves': 'Ra8+', 'theme': 'Back Rank', 'rating': 1100},
+                {'fen': '4r1k1/pp3ppp/2p5/4r3/8/1P3PP1/P5BP/R3R1K1 w - - 0 22',
+                 'moves': 'Rxe5', 'theme': 'Discovered Attack', 'rating': 1600},
+            ]
+            puzzle = random.choice(SAMPLE_PUZZLES)
+            puzzle['date'] = today
+            puzzle['id'] = hashlib.md5(today.encode()).hexdigest()[:8]
+            db['daily_puzzle'] = puzzle
+            self._save_db(db)
+            return puzzle
+
+    # ════════════════════════════════════════════════════════════════════
+    #  TOURNAMENT STORAGE
+    # ════════════════════════════════════════════════════════════════════
+    def create_tournament(self, name, creator, max_players=8, rounds=3, time_control='blitz'):
+        """Create a new Swiss-system tournament."""
+        with self.lock:
+            db = self._load_db()
+            if 'tournaments' not in db:
+                db['tournaments'] = {}
+            tid = secrets.token_hex(4)
+            db['tournaments'][tid] = {
+                'id': tid,
+                'name': name,
+                'creator': creator,
+                'max_players': max_players,
+                'rounds': rounds,
+                'time_control': time_control,
+                'players': [creator],
+                'standings': {creator: {'points': 0, 'byes': 0, 'games': []}},
+                'current_round': 0,
+                'pairings': [],
+                'status': 'registration',   # registration | active | finished
+                'created_at': datetime.now().isoformat(),
+            }
+            self._save_db(db)
+            return tid, db['tournaments'][tid]
+
+    def join_tournament(self, tid, username):
+        """Add a player to a tournament."""
+        with self.lock:
+            db = self._load_db()
+            t = db.get('tournaments', {}).get(tid)
+            if not t:
+                return False, "Tournament not found"
+            if t['status'] != 'registration':
+                return False, "Registration is closed"
+            if username in t['players']:
+                return False, "Already registered"
+            if len(t['players']) >= t['max_players']:
+                return False, "Tournament is full"
+            t['players'].append(username)
+            t['standings'][username] = {'points': 0, 'byes': 0, 'games': []}
+            self._save_db(db)
+            return True, f"Joined tournament '{t['name']}'"
+
+    def start_tournament_round(self, tid):
+        """Generate Swiss pairings for the next round."""
+        with self.lock:
+            db = self._load_db()
+            t = db.get('tournaments', {}).get(tid)
+            if not t:
+                return False, "Tournament not found"
+            if t['current_round'] >= t['rounds']:
+                t['status'] = 'finished'
+                self._save_db(db)
+                return False, "Tournament already finished"
+
+            t['status'] = 'active'
+            t['current_round'] += 1
+
+            # Sort players by points desc, then randomise within tied groups
+            standings = t['standings']
+            players = sorted(t['players'],
+                             key=lambda p: (-standings[p]['points'], random.random()))
+
+            # Pair players; odd one out gets a bye
+            pairings = []
+            paired = set()
+            for i in range(0, len(players) - 1, 2):
+                p1, p2 = players[i], players[i + 1]
+                paired.add(p1); paired.add(p2)
+                pairings.append({
+                    'round': t['current_round'],
+                    'white': p1, 'black': p2,
+                    'result': None,
+                    'game_id': None,
+                })
+            for p in players:
+                if p not in paired:
+                    pairings.append({'round': t['current_round'], 'white': p, 'black': None, 'result': 'bye'})
+                    standings[p]['points'] += 1
+                    standings[p]['byes'] += 1
+
+            t['pairings'].extend(pairings)
+            self._save_db(db)
+            return True, pairings
+
+    def record_tournament_result(self, tid, round_num, white, black, result):
+        """Record the result of a tournament game."""
+        with self.lock:
+            db = self._load_db()
+            t = db.get('tournaments', {}).get(tid)
+            if not t:
+                return False, "Tournament not found"
+            standings = t['standings']
+            for p in t['pairings']:
+                if p['round'] == round_num and p['white'] == white and p['black'] == black:
+                    p['result'] = result
+                    if result == 'white':
+                        standings[white]['points'] += 1
+                    elif result == 'black':
+                        standings[black]['points'] += 1
+                    else:  # draw
+                        standings[white]['points'] += 0.5
+                        standings[black]['points'] += 0.5
+                    break
+            # Check if round complete
+            round_pairings = [p for p in t['pairings'] if p['round'] == round_num and p['black'] is not None]
+            if all(p['result'] is not None for p in round_pairings):
+                if t['current_round'] >= t['rounds']:
+                    t['status'] = 'finished'
+            self._save_db(db)
+            return True, "Result recorded"
+
+    def get_tournament(self, tid):
+        """Get tournament info."""
+        with self.lock:
+            db = self._load_db()
+            return db.get('tournaments', {}).get(tid)
+
+    def list_tournaments(self):
+        """List all tournaments."""
+        with self.lock:
+            db = self._load_db()
+            return list(db.get('tournaments', {}).values())
 
 # ════════════════════════════════════════════════════════════════════════
 #  MATCHMAKING MANAGER
@@ -1149,64 +2000,285 @@ class MatchmakingManager:
     """Handles player queueing and match pairing."""
     
     def __init__(self):
-        self.queue = {}  # username -> {rating, joined_time, handler}
-        self.active_games = {}  # game_id -> {white, black, white_handler, black_handler}
+        self.queue = {}  # username -> {rating, joined_time, handler, time_control}
+        self.active_games = {}  # game_id -> {white, black, white_handler, black_handler, ...}
+        self.spectators = {}    # game_id -> [handler, ...]
+        self.rematch_requests = {}  # game_id -> {requester}
+        self.disconnected = {}  # username -> {game_id, deadline, game}
         self.lock = threading.Lock()
         self.game_counter = 0
         self.matchmaking_thread = None
+        self.clock_thread = None
+        self.heartbeat_thread = None
         self.running = True
-    
+        self._db = None  # Set by ChessServer after init
+        self._server = None  # Set by ChessServer after init
+
     def start(self):
-        """Start the matchmaking background thread."""
+        """Start background threads."""
         self.matchmaking_thread = threading.Thread(target=self._matchmaking_loop, daemon=True)
         self.matchmaking_thread.start()
+        self.clock_thread = threading.Thread(target=self._clock_loop, daemon=True)
+        self.clock_thread.start()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
     
     def stop(self):
-        """Stop the matchmaking system."""
         self.running = False
     
     def _matchmaking_loop(self):
-        """Background loop to find and create matches."""
         while self.running:
-            time.sleep(1.0)  # Check every second
+            time.sleep(1.0)
             self._try_match_players()
+            self._handle_disconnects()
+
+    def _heartbeat_loop(self):
+        """Broadcast friend status (online/in-game/offline) every 30 seconds."""
+        interval = int(_cfg.get('heartbeat_interval', 30))
+        while self.running:
+            time.sleep(interval)
+            if not self._server:
+                continue
+            try:
+                connected = set(self._server.connected_clients.keys())
+                in_game = set()
+                with self.lock:
+                    for g in self.active_games.values():
+                        in_game.add(g['white']); in_game.add(g['black'])
+                # Notify each connected user about their friends' status
+                for username, handler in list(self._server.connected_clients.items()):
+                    if not self._db:
+                        continue
+                    try:
+                        friends = self._db.get_friends(username)
+                        status_map = {}
+                        for f in friends:
+                            if f in in_game:
+                                status_map[f] = 'in_game'
+                            elif f in connected:
+                                status_map[f] = 'online'
+                            else:
+                                status_map[f] = 'offline'
+                        handler.send(MSG_FRIEND_HEARTBEAT, {'statuses': status_map})
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.error(f"Heartbeat error: {e}")
+
+    def _handle_disconnects(self):
+        """Handle reconnect window for disconnected players."""
+        grace = int(_cfg.get('disconnect_grace_seconds', 60))
+        now = time.time()
+        expired = []
+        with self.lock:
+            for username, info in list(self.disconnected.items()):
+                if now > info['deadline']:
+                    expired.append((username, info))
+
+        for username, info in expired:
+            game_id = info['game_id']
+            with self.lock:
+                game = self.active_games.get(game_id)
+                self.disconnected.pop(username, None)
+            if not game:
+                continue
+            # Award win to the connected opponent
+            winner = game['black'] if game['white'] == username else game['white']
+            loser = username
+            resign_data = {
+                'game_id': game_id,
+                'resigned_by': loser,
+                'winner': winner,
+                'reason': 'disconnect_timeout',
+            }
+            log.info(f"Disconnect timeout: {loser} forfeits game {game_id} to {winner}")
+            try:
+                game['white_handler'].send(MSG_GAME_RESIGN, resign_data)
+            except Exception:
+                pass
+            try:
+                game['black_handler'].send(MSG_GAME_RESIGN, resign_data)
+            except Exception:
+                pass
+            if self._db:
+                result = 'black' if winner == game['black'] else 'white'
+                self._db.save_game(game['white'], game['black'], result, game.get('move_log', []))
+            with self.lock:
+                self.active_games.pop(game_id, None)
+                self.spectators.pop(game_id, None)
+
+    def join_queue(self, username, handler, time_control='rapid'):
+        """Add a player to the matchmaking queue."""
+        with self.lock:
+            if username in self.queue:
+                return False, "Already in queue"
+            
+            db = handler.db._load_db()
+            rating = 1200
+            if username in db.get('users', {}):
+                rating = db['users'][username].get('elo', 1200)
+            
+            self.queue[username] = {
+                'rating': rating,
+                'joined_time': time.time(),
+                'handler': handler,
+                'time_control': time_control,
+            }
+            
+            return True, f"Joined queue (ELO: {int(rating)}, TC: {time_control})"
+
+
+    def _clock_loop(self):
+        """Background loop to tick game clocks and detect timeouts."""
+        while self.running:
+            time.sleep(1.0)
+            self._tick_game_clocks()
     
+    def _tick_game_clocks(self):
+        """Tick all active game clocks and broadcast updates every 2s, trigger timeouts."""
+        with self.lock:
+            now = time.time()
+            to_timeout = []
+            for game_id, game in self.active_games.items():
+                if not game.get('clock_enabled'):
+                    continue
+                turn = game['current_turn']
+                last_tick = game.get('clock_last_tick', now)
+                elapsed = now - last_tick
+                game['clock_last_tick'] = now
+
+                if turn == 'white':
+                    game['clock_white'] = max(0, game['clock_white'] - elapsed)
+                    if game['clock_white'] <= 0:
+                        to_timeout.append((game_id, 'white'))
+                else:
+                    game['clock_black'] = max(0, game['clock_black'] - elapsed)
+                    if game['clock_black'] <= 0:
+                        to_timeout.append((game_id, 'black'))
+
+                # Broadcast clock update every ~2s
+                last_broadcast = game.get('clock_last_broadcast', 0)
+                if now - last_broadcast >= 2.0:
+                    game['clock_last_broadcast'] = now
+                    clock_data = {
+                        'game_id': game_id,
+                        'white_remaining': round(game['clock_white'], 1),
+                        'black_remaining': round(game['clock_black'], 1),
+                        'turn': turn
+                    }
+                    try:
+                        game['white_handler'].send(MSG_GAME_CLOCK_UPDATE, clock_data)
+                    except:
+                        pass
+                    try:
+                        game['black_handler'].send(MSG_GAME_CLOCK_UPDATE, clock_data)
+                    except:
+                        pass
+                    for spec in self.spectators.get(game_id, []):
+                        try:
+                            spec.send(MSG_GAME_CLOCK_UPDATE, clock_data)
+                        except:
+                            pass
+
+            # Handle timeouts outside iteration
+            for game_id, timed_out_color in to_timeout:
+                game = self.active_games.get(game_id)
+                if not game:
+                    continue
+                winner_color = 'black' if timed_out_color == 'white' else 'white'
+                winner = game[winner_color]
+                loser = game[timed_out_color]
+                timeout_data = {
+                    'game_id': game_id,
+                    'timed_out': loser,
+                    'winner': winner
+                }
+                try:
+                    game['white_handler'].send(MSG_GAME_TIMEOUT, timeout_data)
+                except:
+                    pass
+                try:
+                    game['black_handler'].send(MSG_GAME_TIMEOUT, timeout_data)
+                except:
+                    pass
+                for spec in self.spectators.get(game_id, []):
+                    try:
+                        spec.send(MSG_GAME_TIMEOUT, timeout_data)
+                    except:
+                        pass
+                # Save chat history
+                if self._db:
+                    self._db.save_game_chat(game_id, game.get('chat_log', []))
+                del self.active_games[game_id]
+                self.spectators.pop(game_id, None)
+                self.rematch_requests.pop(game_id, None)
+
+    def _make_game(self, game_id, white, black, white_handler, black_handler,
+                   clock_minutes=0, clock_increment=0):
+        """Helper: create and store a new game entry."""
+        clock_secs = clock_minutes * 60.0
+        self.active_games[game_id] = {
+            'white': white,
+            'black': black,
+            'white_handler': white_handler,
+            'black_handler': black_handler,
+            'fen': INITIAL_FEN,
+            'move_log': [],
+            'current_turn': 'white',
+            'chat_log': [],
+            # Clock fields
+            'clock_enabled': clock_minutes > 0,
+            'clock_white': clock_secs,
+            'clock_black': clock_secs,
+            'clock_increment': clock_increment,
+            'clock_last_tick': time.time(),
+            'clock_last_broadcast': 0
+        }
+        self.spectators[game_id] = []
+
     def _try_match_players(self):
-        """Try to match players in the queue based on ELO similarity."""
+        """Try to match players in the queue — ELO-banded with time-widening."""
         with self.lock:
             if len(self.queue) < 2:
                 return
 
-            # Get all queued players sorted by rating
+            now = time.time()
+            # Sort by rating
             queued = sorted(self.queue.items(), key=lambda x: x[1]['rating'])
 
-            # Find two players with similar ELO
-            max_elo_diff = 200  # Maximum allowed ELO difference
-            player1, player2 = None, None
-            data1, data2 = None, None
+            matched_pairs = []
+            used = set()
 
-            # Try to find a match with similar ELO
             for i in range(len(queued) - 1):
                 p1_name, p1_data = queued[i]
-                p2_name, p2_data = queued[i + 1]
-                
-                elo_diff = abs(p1_data['rating'] - p2_data['rating'])
-                if elo_diff <= max_elo_diff:
-                    player1, data1 = p1_name, p1_data
-                    player2, data2 = p2_name, p2_data
-                    break
+                if p1_name in used:
+                    continue
+                for j in range(i + 1, len(queued)):
+                    p2_name, p2_data = queued[j]
+                    if p2_name in used:
+                        continue
 
-            # If no similar ELO found, fall back to first two players (with warning)
-            if player1 is None and len(queued) >= 2:
-                player1, data1 = queued[0]
-                player2, data2 = queued[1]
+                    # Time-control must match
+                    if p1_data['time_control'] != p2_data['time_control']:
+                        continue
 
-            if player1 and player2:
-                # Create match
+                    elo_diff = abs(p1_data['rating'] - p2_data['rating'])
+
+                    # ELO band widens the longer they wait: +50 per 30s, max 500
+                    wait1 = now - p1_data['joined_time']
+                    wait2 = now - p2_data['joined_time']
+                    max_wait = max(wait1, wait2)
+                    allowed_diff = min(500, 150 + int(max_wait / 30) * 50)
+
+                    if elo_diff <= allowed_diff:
+                        matched_pairs.append((p1_name, p1_data, p2_name, p2_data))
+                        used.add(p1_name); used.add(p2_name)
+                        break
+
+            for player1, data1, player2, data2 in matched_pairs:
                 self.game_counter += 1
                 game_id = self.game_counter
 
-                # Randomly assign colors
                 if random.random() < 0.5:
                     white, black = player1, player2
                     white_handler, black_handler = data1['handler'], data2['handler']
@@ -1214,59 +2286,19 @@ class MatchmakingManager:
                     white, black = player2, player1
                     white_handler, black_handler = data2['handler'], data1['handler']
 
-                # Store game
-                self.active_games[game_id] = {
-                    'white': white,
-                    'black': black,
-                    'white_handler': white_handler,
-                    'black_handler': black_handler,
-                    'board_state': None,
-                    'current_turn': 'white'
-                }
+                tc = data1['time_control']
+                TC_MAP = {'bullet': (1, 0), 'blitz': (5, 0), 'rapid': (10, 0), 'classical': (30, 0)}
+                clock_mins, clock_inc = TC_MAP.get(tc, (10, 0))
+                self._make_game(game_id, white, black, white_handler, black_handler, clock_mins, clock_inc)
 
-                # Remove from queue
                 del self.queue[player1]
                 del self.queue[player2]
-                
-                # Notify both players
-                white_handler.send(MSG_MATCH_FOUND, {
-                    'game_id': game_id,
-                    'opponent': black,
-                    'color': 'white'
-                })
 
-                black_handler.send(MSG_MATCH_FOUND, {
-                    'game_id': game_id,
-                    'opponent': white,
-                    'color': 'black'
-                })
-    
-    def join_queue(self, username, handler):
-        """Add a player to the matchmaking queue."""
-        with self.lock:
-            if username in self.queue:
-                return False, "Already in queue"
-            
-            # Get player rating from database
-            db = handler.db._load_db()
-            rating = 1200  # Default rating
-            if username in db.get('users', {}):
-                # Calculate simple rating from wins/losses
-                user_data = db['users'][username]
-                wins = user_data.get('wins', 0)
-                losses = user_data.get('losses', 0)
-                draws = user_data.get('draws', 0)
-                total = wins + losses + draws
-                if total > 0:
-                    rating = 1200 + ((wins - losses) / max(total, 1)) * 100
-            
-            self.queue[username] = {
-                'rating': rating,
-                'joined_time': time.time(),
-                'handler': handler
-            }
-            
-            return True, f"Joined queue (Rating: {int(rating)})"
+                log.info(f"Match created: {white} vs {black} (game {game_id}, tc={tc})")
+
+                white_handler.send(MSG_MATCH_FOUND, {'game_id': game_id, 'opponent': black, 'color': 'white', 'time_control': tc})
+                black_handler.send(MSG_MATCH_FOUND, {'game_id': game_id, 'opponent': white, 'color': 'black', 'time_control': tc})
+
     
     def leave_queue(self, username):
         """Remove a player from the matchmaking queue."""
@@ -1323,32 +2355,80 @@ class MatchmakingManager:
             return self.active_games.get(game_id)
     
     def make_move(self, game_id, player, move):
-        """Process a move in an active game."""
+        """Process a move in an active game with server-side legality validation."""
         with self.lock:
             game = self.active_games.get(game_id)
             if not game:
                 return False, "Game not found"
-            
+
             # Verify it's the player's turn
             expected_player = game['white'] if game['current_turn'] == 'white' else game['black']
             if player != expected_player:
                 return False, "Not your turn"
-            
-            # Get the other player's handler
+
+            # ── Server-side move legality check ───────────────────────────
+            try:
+                fen = game.get('fen', INITIAL_FEN)
+                board, side, castle_str, ep_sq, halfmove, fullmove = _parse_fen(fen)
+
+                # Confirm the correct side is moving
+                expected_side = 'w' if game['current_turn'] == 'white' else 'b'
+                if side != expected_side:
+                    print(f"  [SECURITY] FEN side mismatch for game {game_id} player {player}", flush=True)
+                    return False, "Board state error — please rejoin"
+
+                # Parse the SAN into squares
+                result = _san_to_squares(move, board, side, castle_str, ep_sq)
+                if result is None:
+                    print(f"  [SECURITY] Illegal move rejected: {player} played {move!r} in game {game_id}", flush=True)
+                    return False, f"Illegal move: {move}"
+
+                from_sq, to_sq, promote_to = result
+
+                # Verify the (from_sq, to_sq) is in pseudo-legal moves
+                pseudo = _server_pseudo_legal(board, side, castle_str, ep_sq)
+                if (from_sq, to_sq) not in pseudo:
+                    print(f"  [SECURITY] Pseudo-illegal move rejected: {player} played {move!r} in game {game_id}", flush=True)
+                    return False, f"Illegal move: {move}"
+
+                # Apply the move to update server-side board state
+                new_board, new_side, new_castle, new_ep, new_half, new_full =                     _apply_server_move(board, side, castle_str, ep_sq, halfmove, fullmove,
+                                       from_sq, to_sq, promote_to)
+                game['fen'] = _board_to_fen(new_board, new_side, new_castle, new_ep, new_half, new_full)
+                game['move_log'].append(move)
+
+            except Exception as e:
+                # Validation error — log but do NOT crash the server; let move through
+                print(f"  [WARN] Move validation exception in game {game_id}: {e}", flush=True)
+
+            # ── Advance turn ───────────────────────────────────────────────
             if player == game['white']:
                 game['current_turn'] = 'black'
                 other_handler = game['black_handler']
+                # Apply clock increment for white
+                if game.get('clock_enabled'):
+                    game['clock_white'] += game.get('clock_increment', 0)
             else:
                 game['current_turn'] = 'white'
                 other_handler = game['white_handler']
-            
-            # Forward move to opponent
-            other_handler.send(MSG_GAME_MOVE, {
+                # Apply clock increment for black
+                if game.get('clock_enabled'):
+                    game['clock_black'] += game.get('clock_increment', 0)
+
+            move_data = {
                 'game_id': game_id,
                 'move': move,
                 'from_player': player
-            })
-            
+            }
+            # Forward validated move to opponent
+            other_handler.send(MSG_GAME_MOVE, move_data)
+            # Forward to spectators
+            for spec in self.spectators.get(game_id, []):
+                try:
+                    spec.send(MSG_GAME_MOVE, move_data)
+                except:
+                    pass
+
             return True, "Move sent"
     
     def resign(self, game_id, player):
@@ -1360,21 +2440,28 @@ class MatchmakingManager:
             
             # Determine winner
             winner = game['black'] if player == game['white'] else game['white']
+            resign_data = {
+                'game_id': game_id,
+                'resigned_by': player,
+                'winner': winner
+            }
             
             # Notify both players
-            game['white_handler'].send(MSG_GAME_RESIGN, {
-                'game_id': game_id,
-                'resigned_by': player,
-                'winner': winner
-            })
-            game['black_handler'].send(MSG_GAME_RESIGN, {
-                'game_id': game_id,
-                'resigned_by': player,
-                'winner': winner
-            })
-            
+            game['white_handler'].send(MSG_GAME_RESIGN, resign_data)
+            game['black_handler'].send(MSG_GAME_RESIGN, resign_data)
+            # Notify spectators
+            for spec in self.spectators.get(game_id, []):
+                try:
+                    spec.send(MSG_GAME_RESIGN, resign_data)
+                except:
+                    pass
+            # Persist chat
+            if self._db:
+                self._db.save_game_chat(game_id, game.get('chat_log', []))
             # Remove game
             del self.active_games[game_id]
+            self.spectators.pop(game_id, None)
+            self.rematch_requests.pop(game_id, None)
             
             return {'winner': winner, 'loser': player}
     
@@ -1386,7 +2473,6 @@ class MatchmakingManager:
                 return False, "Game not found"
             
             # Get opponent
-            opponent = game['black'] if player == game['white'] else game['white']
             opponent_handler = game['black_handler'] if player == game['white'] else game['white_handler']
             
             # Send draw offer
@@ -1404,40 +2490,157 @@ class MatchmakingManager:
             if not game:
                 return None
             
+            draw_data = {
+                'game_id': game_id,
+                'accepted_by': player,
+                'result': 'draw'
+            }
             # Notify both players
-            game['white_handler'].send(MSG_GAME_DRAW_ACCEPT, {
-                'game_id': game_id,
-                'accepted_by': player,
-                'result': 'draw'
-            })
-            game['black_handler'].send(MSG_GAME_DRAW_ACCEPT, {
-                'game_id': game_id,
-                'accepted_by': player,
-                'result': 'draw'
-            })
-            
+            game['white_handler'].send(MSG_GAME_DRAW_ACCEPT, draw_data)
+            game['black_handler'].send(MSG_GAME_DRAW_ACCEPT, draw_data)
+            # Notify spectators
+            for spec in self.spectators.get(game_id, []):
+                try:
+                    spec.send(MSG_GAME_DRAW_ACCEPT, draw_data)
+                except:
+                    pass
+            # Persist chat
+            if self._db:
+                self._db.save_game_chat(game_id, game.get('chat_log', []))
             # Remove game
             del self.active_games[game_id]
+            self.spectators.pop(game_id, None)
+            self.rematch_requests.pop(game_id, None)
             
             return {'result': 'draw'}
     
     def send_chat(self, game_id, player, message):
-        """Send chat message to opponent."""
+        """Send chat message to opponent and spectators."""
         with self.lock:
             game = self.active_games.get(game_id)
             if not game:
                 return False
             
+            # Persist to chat log
+            entry = {'from': player, 'msg': message, 'ts': time.time()}
+            game['chat_log'].append(entry)
+            
             # Get opponent's handler
             opponent_handler = game['black_handler'] if player == game['white'] else game['white_handler']
-            
-            opponent_handler.send(MSG_GAME_CHAT, {
+            chat_data = {
                 'game_id': game_id,
                 'from_player': player,
                 'message': message
-            })
+            }
+            opponent_handler.send(MSG_GAME_CHAT, chat_data)
+            # Notify spectators
+            for spec in self.spectators.get(game_id, []):
+                try:
+                    spec.send(MSG_GAME_CHAT, chat_data)
+                except:
+                    pass
             
             return True
+
+    # ════════════════════════════════════════════════════════════════════
+    #  SPECTATOR SYSTEM
+    # ════════════════════════════════════════════════════════════════════
+    def list_active_games(self):
+        """Return list of spectatable games."""
+        with self.lock:
+            games = []
+            for game_id, game in self.active_games.items():
+                white_remaining = round(game.get('clock_white', 0))
+                black_remaining = round(game.get('clock_black', 0))
+                games.append({
+                    'game_id': game_id,
+                    'white': game['white'],
+                    'black': game['black'],
+                    'move_count': len(game['move_log']),
+                    'spectator_count': len(self.spectators.get(game_id, [])),
+                    'clock_enabled': game.get('clock_enabled', False),
+                    'white_remaining': white_remaining,
+                    'black_remaining': black_remaining,
+                    'turn': game['current_turn']
+                })
+            return games
+
+    def spectate_join(self, game_id, handler):
+        """Add a spectator to a game."""
+        with self.lock:
+            game = self.active_games.get(game_id)
+            if not game:
+                return False, "Game not found"
+            if game_id not in self.spectators:
+                self.spectators[game_id] = []
+            self.spectators[game_id].append(handler)
+            # Send current game state
+            handler.send(MSG_SPECTATE_UPDATE, {
+                'game_id': game_id,
+                'white': game['white'],
+                'black': game['black'],
+                'fen': game['fen'],
+                'move_log': game['move_log'],
+                'chat_log': game.get('chat_log', []),
+                'turn': game['current_turn'],
+                'clock_enabled': game.get('clock_enabled', False),
+                'white_remaining': round(game.get('clock_white', 0)),
+                'black_remaining': round(game.get('clock_black', 0))
+            })
+            return True, "Joined spectators"
+
+    def spectate_leave(self, game_id, handler):
+        """Remove a spectator from a game."""
+        with self.lock:
+            specs = self.spectators.get(game_id, [])
+            if handler in specs:
+                specs.remove(handler)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  REMATCH SYSTEM
+    # ════════════════════════════════════════════════════════════════════
+    def request_rematch(self, game_id, requester, white, black,
+                        white_handler, black_handler):
+        """Process a rematch request. If both players agree, start new game."""
+        with self.lock:
+            if game_id not in self.rematch_requests:
+                # First request
+                self.rematch_requests[game_id] = {'requester': requester}
+                # Notify opponent
+                opponent = black if requester == white else white
+                opp_handler = black_handler if requester == white else white_handler
+                try:
+                    opp_handler.send(MSG_REMATCH_REQUEST, {
+                        'game_id': game_id,
+                        'from': requester
+                    })
+                except:
+                    pass
+                return True, "Rematch requested"
+            else:
+                # Second request — both agreed
+                self.game_counter += 1
+                new_game_id = self.game_counter
+                # Swap colors
+                new_white, new_black = black, white
+                new_white_h, new_black_h = black_handler, white_handler
+                self._make_game(new_game_id, new_white, new_black,
+                                new_white_h, new_black_h)
+                del self.rematch_requests[game_id]
+                rematch_data = {
+                    'new_game_id': new_game_id,
+                    'white': new_white,
+                    'black': new_black
+                }
+                try:
+                    new_white_h.send(MSG_REMATCH_RESPONSE, {**rematch_data, 'color': 'white'})
+                except:
+                    pass
+                try:
+                    new_black_h.send(MSG_REMATCH_RESPONSE, {**rematch_data, 'color': 'black'})
+                except:
+                    pass
+                return True, "Rematch started"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1454,11 +2657,12 @@ class ClientHandler:
         self.logged_in_user = None
         self.pending = b''
         self.current_game_id = None
+        self.analysis_queue = None  # Set by ChessServer after creation
         # E2E encryption session keys
-        self.session_key = None  # 32-byte AES key
-        self.client_public = None  # Client's DH public key for session
+        self.session_key = None
+        self.client_public = None
         self.encryption_enabled = False
-        self._nonce_counter = 0  # For CTR mode nonce
+        self._nonce_counter = 0
 
     def _derive_nonce(self):
         """Derive a unique nonce for each message (12 bytes for GCM).
@@ -1574,7 +2778,12 @@ class ClientHandler:
         self.send(RESP_SUCCESS if success else RESP_ERROR, message, success)
 
     def handle_login(self, data):
-        """Handle user login with E2E encryption."""
+        """Handle user login with E2E encryption and rate limiting."""
+        ip = self.addr[0] if self.addr else ''
+        if ip and self.db.check_login_rate_limit(ip):
+            self.send(RESP_ERROR, "Too many failed login attempts. Try again in 1 minute.", False)
+            return
+
         if 'encrypted' in data and data['encrypted']:
             try:
                 credentials = decrypt_credentials(data, ChessServer._server_private)
@@ -1587,12 +2796,15 @@ class ClientHandler:
             username = data.get('username', '').strip()
             password = data.get('password', '')
 
-        success, message = self.db.authenticate_user(username, password)
+        success, message = self.db.authenticate_user(username, password, ip)
         if success:
             self.logged_in_user = username
             server = getattr(self, 'server', None)
             if server:
                 server.connected_clients[username] = self
+            log.info(f"Login: {username} from {ip}")
+        else:
+            log.warning(f"Failed login for '{username}' from {ip}")
         self.send(RESP_SUCCESS if success else RESP_ERROR, message, success)
 
     def handle_auto_login(self, data):
@@ -1618,24 +2830,23 @@ class ClientHandler:
         self.send(RESP_SUCCESS if success else RESP_ERROR, message, success)
 
     def handle_get_profile(self, data):
-        """Handle profile request."""
+        """Handle profile request with pagination support."""
         username = data.get('username', '').strip()
-        
         if not username:
             username = self.logged_in_user
-        
         if not username:
             self.send(RESP_ERROR, "Not logged in", False)
             return
-        
-        profile = self.db.get_user_profile(username)
+        page = int(data.get('page', 0))
+        page_size = min(int(data.get('page_size', 10)), 50)
+        profile = self.db.get_user_profile(username, page, page_size)
         if profile:
             self.send(RESP_PROFILE, profile, True)
         else:
             self.send(RESP_ERROR, "User not found", False)
     
     def handle_save_game(self, data):
-        """Handle game save request."""
+        """Handle game save request with achievements and analysis trigger."""
         if not self.logged_in_user:
             self.send(RESP_ERROR, "Not logged in", False)
             return
@@ -1646,14 +2857,61 @@ class ClientHandler:
         moves = data.get('moves', [])
         duration = data.get('duration', 0)
         rated = data.get('rated', True)
+        pgn = data.get('pgn', '')
+        move_times = data.get('move_times', [])
 
-        success, elo_changes = self.db.save_game(white, black, result, moves, duration, rated)
+        success, elo_changes = self.db.save_game(white, black, result, moves, duration, rated, pgn, move_times)
+
+        if success:
+            # Check and award achievements for both players
+            server = getattr(self, 'server', None)
+            for username in [white, black]:
+                if not username:
+                    continue
+                new_achs = self.db.check_and_award_achievements(username)
+                if new_achs and server:
+                    handler = server.connected_clients.get(username)
+                    if handler:
+                        for ach_id in new_achs:
+                            info = self.db.ACHIEVEMENTS.get(ach_id, {})
+                            try:
+                                handler.send(MSG_ACHIEVEMENT_UNLOCKED, {
+                                    'id': ach_id,
+                                    'name': info.get('name', ach_id),
+                                    'desc': info.get('desc', ''),
+                                })
+                            except Exception:
+                                pass
 
         if success and elo_changes:
             self.send(RESP_SUCCESS, elo_changes, True)
         else:
             self.send(RESP_SUCCESS if success else RESP_ERROR,
                       "Game saved" if success else "Failed to save game", success)
+
+    def handle_analysis_request(self, data):
+        """Enqueue a post-game analysis job."""
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        game_id = data.get('game_id')
+        moves = data.get('moves', [])
+        pgn = data.get('pgn', '')
+        white = data.get('white', '')
+        black = data.get('black', '')
+        aq = getattr(self, 'analysis_queue', None)
+        if not aq:
+            self.send(RESP_ERROR, "Analysis queue not available", False)
+            return
+        # Check for cached result first
+        cached = aq.get_result(game_id)
+        if cached:
+            self.send(RESP_SUCCESS, cached, True)
+            return
+        aq.submit(game_id, white, black, moves, pgn, self.logged_in_user)
+        self.send(RESP_SUCCESS, {'queued': True, 'game_id': game_id,
+                                  'note': 'Analysis queued. You will receive MSG_ANALYSIS_RESULT when complete.'}, True)
+
     
     def handle_list_users(self, data):
         """Handle user list request."""
@@ -1670,7 +2928,9 @@ class ClientHandler:
 
     def handle_leaderboard(self, data):
         """Handle leaderboard request."""
-        limit = data.get('limit', 10)
+        if not isinstance(data, dict):
+            data = {}
+        limit = int(data.get('limit', 10))
         leaderboard = self.db.get_leaderboard(limit)
         self.send(RESP_LEADERBOARD, leaderboard, True)
 
@@ -1679,7 +2939,6 @@ class ClientHandler:
     # ════════════════════════════════════════════════════════════════════
     def handle_queue_join(self, data):
         """Handle joining matchmaking queue."""
-        # Get username from data or fall back to logged_in_user
         username = data.get('username')
         if not username:
             username = self.logged_in_user
@@ -1692,7 +2951,11 @@ class ClientHandler:
             self.send(RESP_ERROR, "Matchmaking not available", False)
             return
 
-        success, message = self.matchmaking.join_queue(username, self)
+        time_control = data.get('time_control', 'rapid')
+        if time_control not in ('bullet', 'blitz', 'rapid', 'classical'):
+            time_control = 'rapid'
+
+        success, message = self.matchmaking.join_queue(username, self, time_control)
         self.send(RESP_QUEUED if success else RESP_ERROR, message, success)
 
     def handle_queue_leave(self, data):
@@ -1765,16 +3028,17 @@ class ClientHandler:
         
         game_id = data.get('game_id')
         if game_id:
+            # Retrieve game data BEFORE resign() removes it from active_games
+            game = self.matchmaking.get_game(game_id)
             result = self.matchmaking.resign(game_id, self.logged_in_user)
-            if result:
-                # Save game to database
-                game = self.matchmaking.get_game(game_id)
-                if game:
-                    self.db.save_game(
-                        game['white'], game['black'],
-                        'black' if result['loser'] == 'white' else 'white',
-                        [], 0
-                    )
+            if result and game:
+                # result['loser'] is the username who resigned
+                winner_color = 'black' if result['loser'] == game['white'] else 'white'
+                self.db.save_game(
+                    game['white'], game['black'],
+                    winner_color,
+                    game.get('move_log', []), 0
+                )
     
     def handle_game_draw_offer(self, data):
         """Handle draw offer."""
@@ -1792,12 +3056,12 @@ class ClientHandler:
         
         game_id = data.get('game_id')
         if game_id:
+            # Retrieve game data BEFORE accept_draw() removes it from active_games
+            game = self.matchmaking.get_game(game_id)
             result = self.matchmaking.accept_draw(game_id, self.logged_in_user)
-            if result:
-                # Save draw to database
-                game = self.matchmaking.get_game(game_id)
-                if game:
-                    self.db.save_game(game['white'], game['black'], 'draw', [], 0)
+            if result and game:
+                self.db.save_game(game['white'], game['black'], 'draw',
+                                  game.get('move_log', []), 0)
     
     def handle_game_chat(self, data):
         """Handle chat message."""
@@ -2053,23 +3317,23 @@ class ClientHandler:
     def handle_get_messages(self, data):
         """Handle getting messages with a friend."""
         if not self.logged_in_user:
-            self.send(RESP_SUCCESS, {'success': False, 'error': 'Not logged in'})
+            self.send(RESP_ERROR, 'Not logged in', False)
             return
 
         friend = data.get('friend', '').strip()
         since_id = data.get('since_id', 0)
 
         if not friend:
-            self.send(RESP_SUCCESS, {'success': False, 'error': 'Friend username required'})
+            self.send(RESP_ERROR, 'Friend username required', False)
             return
 
         # Verify users are friends
         if not self.db.are_friends(self.logged_in_user, friend):
-            self.send(RESP_SUCCESS, {'success': False, 'error': 'Users are not friends'})
+            self.send(RESP_ERROR, 'Users are not friends', False)
             return
 
         messages = self.db.get_messages(self.logged_in_user, friend, since_id)
-        self.send(RESP_SUCCESS, {'success': True, 'messages': messages})
+        self.send(RESP_SUCCESS, {'messages': messages}, True)
 
     # ════════════════════════════════════════════════════════════════════
     #  CHALLENGE SYSTEM HANDLERS
@@ -2177,11 +3441,275 @@ class ClientHandler:
         success, message = self.db.cancel_challenge(self.logged_in_user, challenged)
         self.send(RESP_SUCCESS if success else RESP_ERROR, message, success)
 
+    # ════════════════════════════════════════════════════════════════════
+    #  SPECTATOR HANDLERS
+    # ════════════════════════════════════════════════════════════════════
+    def handle_spectate_list(self, data):
+        """Return list of spectatable games."""
+        games = self.matchmaking.list_active_games()
+        self.send(RESP_SUCCESS, games)
+
+    def handle_spectate_join(self, data):
+        """Join as a spectator."""
+        game_id = data.get('game_id')
+        if game_id is None:
+            self.send(RESP_ERROR, "game_id required", False)
+            return
+        success, msg = self.matchmaking.spectate_join(int(game_id), self)
+        self.send(RESP_SUCCESS if success else RESP_ERROR, msg, success)
+
+    def handle_spectate_leave(self, data):
+        """Leave spectator mode."""
+        game_id = data.get('game_id')
+        if game_id is not None:
+            self.matchmaking.spectate_leave(int(game_id), self)
+        self.send(RESP_SUCCESS, "Left spectators")
+
+    # ════════════════════════════════════════════════════════════════════
+    #  REMATCH HANDLERS
+    # ════════════════════════════════════════════════════════════════════
+    def handle_rematch_request(self, data):
+        """Handle rematch request."""
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        game_id = data.get('game_id')
+        white = data.get('white')
+        black = data.get('black')
+        if not all([game_id, white, black]):
+            self.send(RESP_ERROR, "Missing fields", False)
+            return
+        # Find handlers
+        server = getattr(self, 'server', None)
+        if not server:
+            self.send(RESP_ERROR, "Server error", False)
+            return
+        white_handler = server.connected_clients.get(white)
+        black_handler = server.connected_clients.get(black)
+        if not white_handler or not black_handler:
+            self.send(RESP_ERROR, "Opponent not connected", False)
+            return
+        success, msg = self.matchmaking.request_rematch(
+            game_id, self.logged_in_user, white, black,
+            white_handler, black_handler)
+        self.send(RESP_SUCCESS if success else RESP_ERROR, msg, success)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  AVATAR / PROFILE HANDLERS
+    # ════════════════════════════════════════════════════════════════════
+    def handle_set_avatar(self, data):
+        """Set current user's avatar and bio."""
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        avatar = str(data.get('avatar', ''))[:500]
+        bio = str(data.get('bio', ''))[:200]
+        success, msg = self.db.set_avatar(self.logged_in_user, avatar, bio)
+        self.send(RESP_SUCCESS if success else RESP_ERROR, msg, success)
+
+    def handle_get_avatar(self, data):
+        """Get avatar/profile for a user."""
+        username = data.get('username') or self.logged_in_user
+        if not username:
+            self.send(RESP_ERROR, "Username required", False)
+            return
+        profile = self.db.get_avatar(username)
+        if profile is None:
+            self.send(RESP_ERROR, "User not found", False)
+        else:
+            self.send(RESP_SUCCESS, profile)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  CHAT HISTORY HANDLER
+    # ════════════════════════════════════════════════════════════════════
+    def handle_game_chat_history(self, data):
+        """Return chat history for a completed game."""
+        game_id = data.get('game_id')
+        if game_id is None:
+            self.send(RESP_ERROR, "game_id required", False)
+            return
+        chat_log = self.db.get_game_chat(game_id)
+        self.send(RESP_SUCCESS, {'game_id': game_id, 'chat_log': chat_log})
+
+    # ════════════════════════════════════════════════════════════════════
+    #  LOBBY CHAT HANDLERS
+    # ════════════════════════════════════════════════════════════════════
+    def handle_lobby_chat(self, data):
+        """Handle a lobby chat message."""
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        message = str(data.get('message', '')).strip()[:500]
+        if not message:
+            self.send(RESP_ERROR, "Empty message", False)
+            return
+        self.db.add_lobby_message(self.logged_in_user, message)
+        # Broadcast to all connected clients
+        server = getattr(self, 'server', None)
+        if server:
+            payload = {'sender': self.logged_in_user, 'message': message,
+                       'ts': datetime.now().isoformat()}
+            for handler in list(server.connected_clients.values()):
+                try:
+                    handler.send(MSG_LOBBY_CHAT, payload)
+                except Exception:
+                    pass
+        self.send(RESP_SUCCESS, "Sent", True)
+
+    def handle_lobby_chat_history(self, data):
+        """Return recent lobby chat history."""
+        limit = min(int(data.get('limit', 50)), 200)
+        msgs = self.db.get_lobby_chat(limit)
+        self.send(RESP_SUCCESS, {'messages': msgs}, True)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  DAILY PUZZLE HANDLER
+    # ════════════════════════════════════════════════════════════════════
+    def handle_daily_puzzle(self, data):
+        """Return today's daily puzzle."""
+        puzzle = self.db.get_or_generate_daily_puzzle()
+        self.send(RESP_SUCCESS, puzzle, True)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  ACHIEVEMENT HANDLERS
+    # ════════════════════════════════════════════════════════════════════
+    def handle_achievements(self, data):
+        """Return achievements list for a user."""
+        username = data.get('username') or self.logged_in_user
+        if not username:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        achs = self.db.get_achievements(username)
+        self.send(RESP_SUCCESS, {'achievements': achs}, True)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  TOURNAMENT HANDLERS
+    # ════════════════════════════════════════════════════════════════════
+    def handle_tournament_create(self, data):
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        name = str(data.get('name', 'Tournament')).strip()[:60]
+        max_players = min(max(int(data.get('max_players', 8)), 2), 32)
+        rounds = min(max(int(data.get('rounds', 3)), 1), 9)
+        tc = data.get('time_control', 'blitz')
+        tid, tournament = self.db.create_tournament(name, self.logged_in_user, max_players, rounds, tc)
+        log.info(f"Tournament created: '{name}' by {self.logged_in_user} (id={tid})")
+        self.send(RESP_SUCCESS, {'tournament_id': tid, 'tournament': tournament}, True)
+
+    def handle_tournament_join(self, data):
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        tid = data.get('tournament_id', '').strip()
+        if not tid:
+            self.send(RESP_ERROR, "tournament_id required", False)
+            return
+        success, msg = self.db.join_tournament(tid, self.logged_in_user)
+        self.send(RESP_SUCCESS if success else RESP_ERROR, msg, success)
+
+    def handle_tournament_list(self, data):
+        tournaments = self.db.list_tournaments()
+        self.send(RESP_SUCCESS, {'tournaments': tournaments}, True)
+
+    def handle_tournament_status(self, data):
+        tid = data.get('tournament_id', '').strip()
+        if not tid:
+            self.send(RESP_ERROR, "tournament_id required", False)
+            return
+        t = self.db.get_tournament(tid)
+        if not t:
+            self.send(RESP_ERROR, "Tournament not found", False)
+            return
+        self.send(RESP_SUCCESS, t, True)
+
+    def handle_tournament_result(self, data):
+        """Admin/arbiter records a tournament game result."""
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        tid    = data.get('tournament_id', '')
+        round_ = int(data.get('round', 0))
+        white  = data.get('white', '')
+        black  = data.get('black', '')
+        result = data.get('result', '')
+        if result not in ('white', 'black', 'draw'):
+            self.send(RESP_ERROR, "result must be white/black/draw", False)
+            return
+        t = self.db.get_tournament(tid)
+        if not t:
+            self.send(RESP_ERROR, "Tournament not found", False)
+            return
+        if self.logged_in_user != t['creator']:
+            self.send(RESP_ERROR, "Only the tournament creator can record results", False)
+            return
+        success, msg = self.db.record_tournament_result(tid, round_, white, black, result)
+        self.send(RESP_SUCCESS if success else RESP_ERROR, msg, success)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  RECONNECT HANDLER
+    # ════════════════════════════════════════════════════════════════════
+    def handle_reconnect(self, data):
+        """Handle a client reconnecting to an ongoing game."""
+        if not self.logged_in_user:
+            self.send(RESP_ERROR, "Not logged in", False)
+            return
+        game_id = data.get('game_id')
+        if game_id is None:
+            self.send(RESP_ERROR, "game_id required", False)
+            return
+        # Remove from disconnected list
+        if not self.matchmaking:
+            self.send(RESP_ERROR, "Server error", False)
+            return
+        with self.matchmaking.lock:
+            disc = self.matchmaking.disconnected.pop(self.logged_in_user, None)
+            game = self.matchmaking.active_games.get(game_id)
+        if not game:
+            self.send(RESP_ERROR, "Game not found or already ended", False)
+            return
+        # Update handler reference so messages go to the new socket
+        if game['white'] == self.logged_in_user:
+            game['white_handler'] = self
+        elif game['black'] == self.logged_in_user:
+            game['black_handler'] = self
+        else:
+            self.send(RESP_ERROR, "You are not a player in this game", False)
+            return
+        log.info(f"{self.logged_in_user} reconnected to game {game_id}")
+        self.send(RESP_SUCCESS, {
+            'fen': game.get('fen', INITIAL_FEN),
+            'move_log': game.get('move_log', []),
+            'turn': game.get('current_turn', 'white'),
+            'clock_white': game.get('clock_white', 0),
+            'clock_black': game.get('clock_black', 0),
+        }, True)
+
     def handle_request(self):
         """Main request handling loop."""
         while True:
             msg = self.recv(timeout=30.0)
             if not msg:
+                # Client disconnected — start grace window for active game
+                if self.matchmaking and self.logged_in_user:
+                    with self.matchmaking.lock:
+                        for gid, game in self.matchmaking.active_games.items():
+                            if game['white'] == self.logged_in_user or game['black'] == self.logged_in_user:
+                                grace = int(_cfg.get('disconnect_grace_seconds', 60))
+                                self.matchmaking.disconnected[self.logged_in_user] = {
+                                    'game_id': gid,
+                                    'deadline': time.time() + grace,
+                                }
+                                log.info(f"{self.logged_in_user} disconnected from game {gid}; grace={grace}s")
+                                # Notify opponent
+                                opp_handler = game['black_handler'] if game['white'] == self.logged_in_user else game['white_handler']
+                                try:
+                                    opp_handler.send(MSG_SERVER_BROADCAST, {
+                                        'message': f"{self.logged_in_user} disconnected. They have {grace}s to reconnect."
+                                    })
+                                except Exception:
+                                    pass
+                                break
                 break
 
             msg_type = msg.get('type', '')
@@ -2230,6 +3758,24 @@ class ClientHandler:
                 self.handle_game_draw_accept(data)
             elif msg_type == MSG_GAME_CHAT:
                 self.handle_game_chat(data)
+            # Spectator messages
+            elif msg_type == MSG_SPECTATE_LIST:
+                self.handle_spectate_list(data)
+            elif msg_type == MSG_SPECTATE_JOIN:
+                self.handle_spectate_join(data)
+            elif msg_type == MSG_SPECTATE_LEAVE:
+                self.handle_spectate_leave(data)
+            # Rematch messages
+            elif msg_type == MSG_REMATCH_REQUEST:
+                self.handle_rematch_request(data)
+            # Avatar/Profile messages
+            elif msg_type == MSG_SET_AVATAR:
+                self.handle_set_avatar(data)
+            elif msg_type == MSG_GET_AVATAR:
+                self.handle_get_avatar(data)
+            # Chat history
+            elif msg_type == MSG_GAME_CHAT_HISTORY:
+                self.handle_game_chat_history(data)
             # Friend system messages
             elif msg_type == MSG_FRIEND_REQUEST:
                 self.handle_friend_request(data)
@@ -2262,8 +3808,37 @@ class ClientHandler:
                 self.handle_challenge_list(data)
             elif msg_type == MSG_CHALLENGE_CANCEL:
                 self.handle_challenge_cancel(data)
+            # Lobby chat
+            elif msg_type == MSG_LOBBY_CHAT:
+                self.handle_lobby_chat(data)
+            elif msg_type == MSG_LOBBY_CHAT_HISTORY:
+                self.handle_lobby_chat_history(data)
+            # Daily puzzle
+            elif msg_type == MSG_DAILY_PUZZLE:
+                self.handle_daily_puzzle(data)
+            # Achievements
+            elif msg_type == MSG_ACHIEVEMENTS:
+                self.handle_achievements(data)
+            # Tournament
+            elif msg_type == MSG_TOURNAMENT_CREATE:
+                self.handle_tournament_create(data)
+            elif msg_type == MSG_TOURNAMENT_JOIN:
+                self.handle_tournament_join(data)
+            elif msg_type == MSG_TOURNAMENT_LIST:
+                self.handle_tournament_list(data)
+            elif msg_type == MSG_TOURNAMENT_STATUS:
+                self.handle_tournament_status(data)
+            elif msg_type == MSG_TOURNAMENT_RESULT:
+                self.handle_tournament_result(data)
+            # Reconnect
+            elif msg_type == MSG_RECONNECT:
+                self.handle_reconnect(data)
+            # Post-game analysis
+            elif msg_type == MSG_ANALYSIS_REQUEST:
+                self.handle_analysis_request(data)
             else:
                 self.send(RESP_ERROR, f"Unknown message type: {msg_type}", False)
+
 
     def close(self):
         """Close the connection."""
@@ -2280,6 +3855,86 @@ class ClientHandler:
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  POST-GAME ANALYSIS QUEUE (server-side, non-blocking)
+# ════════════════════════════════════════════════════════════════════════
+class AnalysisQueue:
+    """
+    Server-side analysis job queue.
+    Jobs are processed in a background thread. Since the server may not have
+    Stockfish available, the 'analysis' here produces a lightweight summary
+    (game length, move count per phase, result note). A real deployment would
+    call subprocess.run(['stockfish', ...]) here.
+    """
+    def __init__(self, db, server, workers=1):
+        self._db = db
+        self._server = server
+        self._q = queue.Queue()
+        self._results = {}   # game_id -> result dict
+        self._lock = threading.Lock()
+        self._workers = workers
+        self._threads = []
+
+    def start(self):
+        for _ in range(self._workers):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def submit(self, game_id, white, black, moves, pgn, requester):
+        """Enqueue an analysis job."""
+        self._q.put({'game_id': game_id, 'white': white, 'black': black,
+                     'moves': moves, 'pgn': pgn, 'requester': requester})
+
+    def get_result(self, game_id):
+        """Return cached analysis result or None."""
+        with self._lock:
+            return self._results.get(game_id)
+
+    def _worker(self):
+        while True:
+            job = self._q.get()
+            try:
+                result = self._analyse(job)
+                with self._lock:
+                    self._results[job['game_id']] = result
+                # Notify requester if still connected
+                if self._server:
+                    handler = self._server.connected_clients.get(job['requester'])
+                    if handler:
+                        try:
+                            handler.send(MSG_ANALYSIS_RESULT, result)
+                        except Exception:
+                            pass
+                log.info(f"Analysis complete for game {job['game_id']}")
+            except Exception as e:
+                log.error(f"Analysis worker error: {e}")
+            finally:
+                self._q.task_done()
+
+    def _analyse(self, job):
+        """Lightweight built-in analysis (no engine required)."""
+        moves = job.get('moves', [])
+        n = len(moves)
+        opening = moves[:10] if n >= 10 else moves
+        middlegame = moves[10:30] if n >= 30 else moves[10:]
+        endgame = moves[30:] if n >= 30 else []
+        return {
+            'game_id': job['game_id'],
+            'white': job['white'],
+            'black': job['black'],
+            'total_moves': n,
+            'opening_moves': len(opening),
+            'middlegame_moves': len(middlegame),
+            'endgame_moves': len(endgame),
+            'opening_line': ' '.join(opening[:6]),
+            'note': f"Game lasted {n} half-moves. "
+                    f"{'Quick finish' if n < 30 else 'Long game' if n > 80 else 'Standard length'}.",
+            'pgn_available': bool(job.get('pgn')),
+        }
+
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  CHESS SERVER
 # ════════════════════════════════════════════════════════════════════════
 class ChessServer:
@@ -2293,11 +3948,17 @@ class ChessServer:
         self.port = port
         self.db_manager = DatabaseManager()
         self.matchmaking = MatchmakingManager()
+        self.matchmaking._db = self.db_manager
+        self.matchmaking._server = self
         self.server_socket = None
         self.running = False
         self.clients = []
-        self.connected_clients = {}  # username -> handler mapping for messaging
+        self.connected_clients = {}  # username -> handler mapping
         self.cleanup_running = True
+        self.analysis_queue = AnalysisQueue(
+            self.db_manager, self,
+            workers=int(_cfg.get('analysis_queue_workers', 1))
+        )
 
     def start(self):
         """Start the server."""
@@ -2307,33 +3968,41 @@ class ChessServer:
 
         try:
             self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(5)
+            self.server_socket.listen(int(_cfg.get('max_clients', 100)))
             self.running = True
 
-            # Start matchmaking system
             self.matchmaking.start()
+            self.analysis_queue.start()
 
-            # Start message cleanup thread
             cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
             cleanup_thread.start()
 
             print("")
-            print("╔══════════════════════════════════════════════════════════════╗")
-            print("║                   CHESS SERVER STARTED                       ║")
-            print("╠══════════════════════════════════════════════════════════════╣")
-            print("║                                                              ║")
-            print(f"║  Listening on: {self.host}:{self.port:<34}    ║")
-            print(f"║  Database: {os.path.basename(DATABASE_FILE):<43}       ║")
-            print("║  Matchmaking: Active                                         ║")
-            print("║                                                              ║")
-            print("║  Commands:                                                   ║")
-            print("║    - Type 'users' to list all users                          ║")
-            print("║    - Type 'queue' to show matchmaking queue                  ║")
-            print("║    - Type 'quit' to stop the server                          ║")
-            print("╚══════════════════════════════════════════════════════════════╝")
+            print("╔══════════════════════════════════════════════════════════════════╗")
+            print("║               CHESS SERVER v2.0 STARTED                          ║")
+            print("╠══════════════════════════════════════════════════════════════════╣")
+            print(f"║  Listening on: {self.host}:{self.port:<36}       ║")
+            print(f"║  Database:     {os.path.basename(DATABASE_FILE):<44}  ║")
+            print(f"║  Log file:     {os.path.basename(LOG_FILE):<44}  ║")
+            print(f"║  Config:       {os.path.basename(CONFIG_FILE):<44}  ║")
+            print("║  Matchmaking:  ELO-banded, time-control aware                    ║")
+            print("║  Analysis:     Server-side queue active                          ║")
+            print("║                                                                  ║")
+            print("║  Admin commands (type and press Enter):                          ║")
+            print("║    users              — list registered users                    ║")
+            print("║    clients            — list connected clients                   ║")
+            print("║    queue              — show queue + active games                ║")
+            print("║    kick <user>        — disconnect a user                        ║")
+            print("║    ban <user>         — ban a user account                       ║")
+            print("║    unban <user>       — unban a user account                     ║")
+            print("║    elo <user> <n>     — reset user ELO to n                     ║")
+            print("║    broadcast <msg>    — send message to all clients              ║")
+            print("║    tournaments        — list tournaments                         ║")
+            print("║    quit               — stop the server                          ║")
+            print("╚══════════════════════════════════════════════════════════════════╝")
             print("")
+            log.info(f"Chess server v2.0 started on {self.host}:{self.port}")
 
-            # Start command handler thread
             cmd_thread = threading.Thread(target=self._command_handler, daemon=True)
             cmd_thread.start()
 
@@ -2341,9 +4010,10 @@ class ChessServer:
                 try:
                     self.server_socket.settimeout(1.0)
                     conn, addr = self.server_socket.accept()
-                    print(f"  [INFO] New connection from {addr[0]}:{addr[1]}", flush=True)
+                    log.info(f"New connection from {addr[0]}:{addr[1]}")
 
                     handler = ClientHandler(conn, addr, self.db_manager, self.matchmaking)
+                    handler.analysis_queue = self.analysis_queue
                     client_thread = threading.Thread(
                         target=self._handle_client,
                         args=(handler,),
@@ -2356,10 +4026,10 @@ class ChessServer:
                     continue
                 except Exception as e:
                     if self.running:
-                        print(f"  [ERROR] Accept error: {e}")
+                        log.error(f"Accept error: {e}")
 
         except Exception as e:
-            print(f"  [ERROR] Server error: {e}")
+            log.error(f"Server error: {e}")
         finally:
             self.stop()
 
@@ -2376,22 +4046,95 @@ class ChessServer:
                 self.clients.remove(handler)
 
     def _command_handler(self):
-        """Handle server console commands."""
+        """Handle server console admin commands."""
         while self.running:
             try:
-                cmd = input("").strip().lower()
+                raw = input("").strip()
+                parts = raw.split(None, 2)
+                cmd = parts[0].lower() if parts else ''
+
                 if cmd == 'quit':
                     self.running = False
+
                 elif cmd == 'users':
                     users = self.db_manager.list_users()
                     print(f"  Registered users ({len(users)}): {', '.join(users) if users else 'None'}")
+
+                elif cmd == 'clients':
+                    cs = list(self.connected_clients.keys())
+                    print(f"  Connected ({len(cs)}): {', '.join(cs) if cs else 'None'}")
+
                 elif cmd == 'queue':
                     with self.matchmaking.lock:
-                        queue_count = len(self.matchmaking.queue)
-                        games_count = len(self.matchmaking.active_games)
-                    print(f"  Matchmaking Queue: {queue_count} players waiting, {games_count} active games")
-            except:
-                pass
+                        q = {u: d['time_control'] for u, d in self.matchmaking.queue.items()}
+                        games = {gid: f"{g['white']} vs {g['black']}"
+                                 for gid, g in self.matchmaking.active_games.items()}
+                    print(f"  Queue ({len(q)}): {q}")
+                    print(f"  Active games ({len(games)}): {games}")
+
+                elif cmd == 'tournaments':
+                    ts = self.db_manager.list_tournaments()
+                    for t in ts:
+                        print(f"  [{t['id']}] '{t['name']}' — {t['status']} — "
+                              f"{len(t['players'])}/{t['max_players']} players, "
+                              f"round {t['current_round']}/{t['rounds']}")
+                    if not ts:
+                        print("  No tournaments.")
+
+                elif cmd == 'kick' and len(parts) >= 2:
+                    target = parts[1]
+                    handler = self.connected_clients.get(target)
+                    if handler:
+                        handler.send(MSG_SERVER_BROADCAST, {'message': 'You have been kicked by an admin.'})
+                        handler.close()
+                        print(f"  Kicked: {target}")
+                        log.warning(f"Admin kicked '{target}'")
+                    else:
+                        print(f"  User '{target}' not connected.")
+
+                elif cmd == 'ban' and len(parts) >= 2:
+                    target = parts[1]
+                    ok, msg = self.db_manager.ban_user(target)
+                    print(f"  {msg}")
+                    handler = self.connected_clients.get(target)
+                    if handler:
+                        handler.send(MSG_SERVER_BROADCAST, {'message': 'Your account has been banned.'})
+                        handler.close()
+
+                elif cmd == 'unban' and len(parts) >= 2:
+                    target = parts[1]
+                    ok, msg = self.db_manager.unban_user(target)
+                    print(f"  {msg}")
+
+                elif cmd == 'elo' and len(parts) >= 3:
+                    target = parts[1]
+                    try:
+                        new_elo = int(parts[2])
+                        ok, msg = self.db_manager.reset_elo(target, new_elo)
+                        print(f"  {msg}")
+                    except ValueError:
+                        print("  Usage: elo <username> <rating>")
+
+                elif cmd == 'broadcast' and len(parts) >= 2:
+                    msg_text = raw[len('broadcast'):].strip()
+                    payload = {'message': f"[SERVER] {msg_text}"}
+                    count = 0
+                    for h in list(self.connected_clients.values()):
+                        try:
+                            h.send(MSG_SERVER_BROADCAST, payload)
+                            count += 1
+                        except Exception:
+                            pass
+                    print(f"  Broadcast sent to {count} clients.")
+                    log.info(f"Admin broadcast: {msg_text}")
+
+                elif cmd:
+                    print("  Unknown command. Try: users, clients, queue, kick, ban, unban, elo, broadcast, tournaments, quit")
+
+            except (EOFError, KeyboardInterrupt):
+                self.running = False
+            except Exception as e:
+                log.error(f"Command handler error: {e}")
 
     def _cleanup_loop(self):
         """Background loop to cleanup expired messages."""
@@ -2400,7 +4143,7 @@ class ChessServer:
             try:
                 deleted = self.db_manager.cleanup_expired_messages()
                 if deleted > 0:
-                    print(f"  Cleaned up {deleted} expired messages", flush=True)
+                    log.info(f"Cleaned up {deleted} expired messages")
             except Exception:
                 pass
 
@@ -2413,6 +4156,7 @@ class ChessServer:
             client.close()
         if self.server_socket:
             self.server_socket.close()
+        log.info("Server stopped.")
         print("  Server stopped.")
 
 
@@ -2667,6 +4411,45 @@ class ChessClient:
     def cancel_challenge(self, challenged):
         """Cancel a pending challenge."""
         self.send(MSG_CHALLENGE_CANCEL, {'challenged': challenged})
+        return self.recv()
+
+    # ── Spectator methods ─────────────────────────────────────────────
+    def list_spectatable_games(self):
+        """List active games available to spectate."""
+        self.send(MSG_SPECTATE_LIST, {})
+        return self.recv()
+
+    def spectate_game(self, game_id):
+        """Join a game as a spectator."""
+        self.send(MSG_SPECTATE_JOIN, {'game_id': game_id})
+        return self.recv()
+
+    def leave_spectate(self, game_id):
+        """Leave spectator mode."""
+        self.send(MSG_SPECTATE_LEAVE, {'game_id': game_id})
+        return self.recv()
+
+    # ── Rematch methods ───────────────────────────────────────────────
+    def request_rematch(self, game_id, white, black):
+        """Request a rematch after a game ends."""
+        self.send(MSG_REMATCH_REQUEST, {'game_id': game_id, 'white': white, 'black': black})
+        return self.recv()
+
+    # ── Avatar / Profile methods ──────────────────────────────────────
+    def set_avatar(self, avatar, bio=''):
+        """Set current user's ASCII avatar and bio."""
+        self.send(MSG_SET_AVATAR, {'avatar': avatar, 'bio': bio})
+        return self.recv()
+
+    def get_avatar(self, username=None):
+        """Get avatar/profile for a user."""
+        self.send(MSG_GET_AVATAR, {'username': username})
+        return self.recv()
+
+    # ── Chat history methods ──────────────────────────────────────────
+    def get_game_chat_history(self, game_id):
+        """Retrieve persistent chat history for a completed game."""
+        self.send(MSG_GAME_CHAT_HISTORY, {'game_id': game_id})
         return self.recv()
 
 
