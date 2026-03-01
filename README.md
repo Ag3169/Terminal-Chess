@@ -1,4 +1,4 @@
-# Terminal Chess
+# TiChess
 
 A feature-rich terminal-based chess game with online multiplayer, AI opponent, and advanced game analysis.
 
@@ -224,5 +224,5 @@ MIT License - See LICENSE file for details
 
 ## Credits
 
-Terminal Chess - A multiplayer chess platform
+TiChess - A multiplayer chess platform
 Developed with ❤️ for chess enthusiasts
